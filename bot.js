@@ -2442,16 +2442,5 @@ server.listen(PORT, '0.0.0.0', () => {
 });
 
 
-
-
-const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Bot is running!');
-});
-
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Web server listening on port ${PORT}`);
-});
-
 // Start the bot
 startBot();
