@@ -11,6 +11,7 @@ const url = require('url');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 
 dotenv.config();
 
@@ -151,16 +152,27 @@ try {
 // In-memory cache for interactive button callbacks
 const recentScansCache = new Map(); // scanId -> { audit, scripts, fileName, summary }
 const knownChatIds = new Set();
+// Active interactive Q&A sessions (userId -> { scanId, fileName, timestamp })
+const userQuestionSessions = new Map();
 
-function dbSaveScanCache(scanId, fileName, audit) {
+function dbSaveScanCache(scanId, fileName, audit, scripts = []) {
   if (!scanId) return;
-  recentScansCache.set(scanId, { audit, fileName, time: Date.now() });
+  const scriptSummaries = (scripts || []).map((s) => ({
+    path: s.path,
+    size: s.size || (s.content ? s.content.length : 0),
+    content: (s.content || '').slice(0, 35000),
+    type: s.type || 'script',
+  }));
+
+  const cacheItem = { audit, fileName, scripts: scriptSummaries, time: Date.now() };
+  recentScansCache.set(scanId, cacheItem);
+
   if (!useFallbackDb && sqliteDb) {
     try {
       sqliteDb.prepare(`
         INSERT OR REPLACE INTO scan_cache (scan_id, file_name, audit_json, created_at)
         VALUES (?, ?, ?, ?)
-      `).run(scanId, fileName, JSON.stringify(audit), Date.now());
+      `).run(scanId, fileName, JSON.stringify({ audit, scripts: scriptSummaries }), Date.now());
     } catch (e) {}
   }
 }
@@ -173,8 +185,13 @@ function dbGetScanCache(scanId) {
     try {
       const row = sqliteDb.prepare('SELECT * FROM scan_cache WHERE scan_id = ?').get(scanId);
       if (row && row.audit_json) {
-        const audit = JSON.parse(row.audit_json);
-        const obj = { audit, fileName: row.file_name, time: row.created_at };
+        const parsed = JSON.parse(row.audit_json);
+        const obj = {
+          audit: parsed.audit || parsed,
+          scripts: parsed.scripts || [],
+          fileName: row.file_name,
+          time: row.created_at,
+        };
         recentScansCache.set(scanId, obj);
         return obj;
       }
@@ -866,21 +883,119 @@ function extractStringsFromBinary(buf, minLen = 4) {
   return strings;
 }
 
-function extractPotentialKeys(contextText = '') {
-  const keys = new Set(['root', 'magisk', 'kernelsu', 'android', '123456', 'toshitzz', 'module']);
-  if (!contextText) return Array.from(keys);
+function tryDecompress(buf) {
+  if (!buf || buf.length < 4) return null;
+  // Gzip magic \x1f\x8b
+  if (buf[0] === 0x1f && buf[1] === 0x8b) {
+    try {
+      return zlib.gunzipSync(buf);
+    } catch (e) {}
+  }
+  // Zlib / Deflate
+  try {
+    return zlib.inflateSync(buf);
+  } catch (e) {}
+  try {
+    return zlib.inflateRawSync(buf);
+  } catch (e) {}
+  return null;
+}
 
-  const patterns = [
-    /(?:key|pass|password|secret)\s*=\s*["']([^"']+)["']/gi,
-    /-k\s+["']?([a-zA-Z0-9_\-\.\@\$]+)["']?/gi,
-    /-pass\s+(?:pass:)?["']?([^"'\s]+)["']?/gi,
-    /openssl\s+enc\s+.*-k\s+([^\s]+)/gi,
-  ];
-  for (const pat of patterns) {
-    let match;
-    while ((match = pat.exec(contextText)) !== null) {
-      if (match[1] && match[1].length >= 2) {
-        keys.add(match[1].trim());
+function rc4Decrypt(keyStr, data) {
+  if (!keyStr || !data || data.length === 0) return null;
+  try {
+    const key = Buffer.from(keyStr);
+    const S = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) S[i] = i;
+    let j = 0;
+    for (let i = 0; i < 256; i++) {
+      j = (j + S[i] + key[i % key.length]) & 255;
+      const tmp = S[i];
+      S[i] = S[j];
+      S[j] = tmp;
+    }
+    let i = 0;
+    j = 0;
+    const out = Buffer.alloc(data.length);
+    for (let k = 0; k < data.length; k++) {
+      i = (i + 1) & 255;
+      j = (j + S[i]) & 255;
+      const tmp = S[i];
+      S[i] = S[j];
+      S[j] = tmp;
+      out[k] = data[k] ^ S[(S[i] + S[j]) & 255];
+    }
+    return out;
+  } catch (e) {
+    return null;
+  }
+}
+
+function multiByteXor(buf, keyStr) {
+  if (!keyStr || !buf || buf.length === 0) return null;
+  try {
+    const key = Buffer.from(keyStr);
+    const out = Buffer.alloc(buf.length);
+    for (let i = 0; i < buf.length; i++) {
+      out[i] = buf[i] ^ key[i % key.length];
+    }
+    return out;
+  } catch (e) {
+    return null;
+  }
+}
+
+function tryOpenSslAesDecrypt(buf, password) {
+  if (!buf || buf.length < 32 || !password) return null;
+  if (buf.slice(0, 8).toString() !== 'Salted__') return null;
+  const salt = buf.slice(8, 16);
+  const ciphertext = buf.slice(16);
+
+  // EVP_BytesToKey using MD5 (standard OpenSSL enc key derivation)
+  let d = Buffer.alloc(0);
+  let d_i = Buffer.alloc(0);
+  const passBuf = Buffer.from(password);
+  while (d.length < 32 + 16) {
+    const hash = crypto.createHash('md5');
+    if (d_i.length > 0) hash.update(d_i);
+    hash.update(passBuf);
+    hash.update(salt);
+    d_i = hash.digest();
+    d = Buffer.concat([d, d_i]);
+  }
+  const key = d.slice(0, 32);
+  const iv = d.slice(32, 48);
+
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+    return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  } catch (e) {
+    return null;
+  }
+}
+
+function extractPotentialKeys(contextText = '', metadata = {}) {
+  const keys = new Set(['root', 'magisk', 'kernelsu', 'apatch', 'android', '123456', 'toshitzz', 'module', 'system']);
+  if (metadata.id) keys.add(metadata.id.trim());
+  if (metadata.name) keys.add(metadata.name.trim());
+  if (metadata.author) keys.add(metadata.author.trim());
+
+  if (contextText) {
+    const patterns = [
+      /(?:key|pass|password|secret)\s*=\s*["']([^"']+)["']/gi,
+      /-k\s+["']?([a-zA-Z0-9_\-\.\@\$]+)["']?/gi,
+      /-pass\s+(?:pass:)?["']?([^"'\s]+)["']?/gi,
+      /openssl\s+enc\s+.*-k\s+([^\s]+)/gi,
+      /KEY=["']?([^"'\s]+)["']?/gi,
+      /PASS=["']?([^"'\s]+)["']?/gi,
+      /PASSWORD=["']?([^"'\s]+)["']?/gi,
+    ];
+    for (const pat of patterns) {
+      let match;
+      while ((match = pat.exec(contextText)) !== null) {
+        if (match[1] && match[1].length >= 2) {
+          keys.add(match[1].trim());
+        }
       }
     }
   }
@@ -911,17 +1026,37 @@ function trySingleByteXor(buf) {
         return { key, decryptedBytes: decrypted, type: 'SCRIPT' };
       }
     }
+    if ((buf[0] ^ key) === 0x1f && (buf[1] ^ key) === 0x8b) {
+      const decrypted = Buffer.alloc(buf.length);
+      for (let i = 0; i < buf.length; i++) {
+        decrypted[i] = buf[i] ^ key;
+      }
+      const decompressed = tryDecompress(decrypted);
+      if (decompressed) {
+        if (isElfBinary(decompressed)) return { key, decryptedBytes: decompressed, type: 'ELF' };
+        if (isPrintableScript(decompressed)) return { key, decryptedBytes: decompressed, type: 'SCRIPT' };
+      }
+    }
   }
   return null;
 }
 
-function attemptDeepDecryption(fileName, rawContent, contextScripts = '') {
+function attemptDeepDecryption(fileName, rawContent, contextScripts = '', metadata = {}) {
   const buf = Buffer.isBuffer(rawContent) ? rawContent : Buffer.from(rawContent);
   const entropy = calculateEntropy(buf);
-  const textContent = typeof rawContent === 'string' ? rawContent : buf.slice(0, 10000).toString('utf-8');
+  const textContent = typeof rawContent === 'string' ? rawContent : buf.slice(0, 20000).toString('utf-8');
 
-  // Check if plain script
-  if (isPrintableScript(buf) && !textContent.includes('base64 -d') && !textContent.includes('eval "$(')) {
+  // Check if plain script without hidden encoded payload
+  if (
+    isPrintableScript(buf) &&
+    !textContent.includes('base64 -d') &&
+    !textContent.includes('base64 --decode') &&
+    !textContent.includes('eval "$(') &&
+    !textContent.includes('openssl enc') &&
+    !textContent.includes('__ARCHIVE_BELOW__') &&
+    !textContent.includes('__PAYLOAD_BEGINS__') &&
+    !textContent.includes('\\x')
+  ) {
     return {
       fileName,
       isEncrypted: false,
@@ -931,7 +1066,176 @@ function attemptDeepDecryption(fileName, rawContent, contextScripts = '') {
     };
   }
 
-  // Single-byte XOR brute force
+  // 1. Check embedded self-extracting archive markers (e.g. __ARCHIVE_BELOW__, tail -n +X)
+  const archiveMarker = textContent.indexOf('__ARCHIVE_BELOW__');
+  const payloadMarker = textContent.indexOf('__PAYLOAD_BEGINS__');
+  const markerIdx = archiveMarker !== -1 ? archiveMarker + 18 : payloadMarker !== -1 ? payloadMarker + 19 : -1;
+  if (markerIdx > 0 && markerIdx < buf.length) {
+    const payloadBuf = buf.slice(markerIdx);
+    const decompressed = tryDecompress(payloadBuf);
+    if (decompressed) {
+      if (isPrintableScript(decompressed)) {
+        const text = decompressed.toString('utf-8');
+        return {
+          fileName,
+          isEncrypted: true,
+          decrypted: true,
+          method: 'Embedded Compressed Archive Unpacker -> Shell Script',
+          entropy,
+          extractedSnippet: text.slice(0, 150),
+          decryptedText: text,
+          details: 'Successfully unpacked and decompressed embedded script payload.',
+        };
+      }
+      if (isElfBinary(decompressed)) {
+        const strings = extractStringsFromBinary(decompressed);
+        return {
+          fileName,
+          isEncrypted: true,
+          decrypted: true,
+          method: 'Embedded Compressed Archive Unpacker -> ELF Binary',
+          entropy,
+          extractedSnippet: strings.slice(0, 10).join('; '),
+          decryptedBytes: decompressed,
+          recoveredCommands: strings.filter((s) => /rm\b|chmod\b|dd\b|sh\b|su\b/i.test(s)),
+          details: 'Successfully unpacked embedded ELF binary payload.',
+        };
+      }
+    }
+  }
+
+  // 2. Multi-layer Base64 Obfuscation Unpacker (Recursively unpack up to 4 layers)
+  const b64Matches = [
+    ...textContent.matchAll(/echo\s+["']?([A-Za-z0-9+/=]{20,})["']?\s*\|\s*base64\s+-(?:d|-decode)/gi),
+    ...textContent.matchAll(/base64\s+-(?:d|-decode)\s+<<<["']?\s*([A-Za-z0-9+/=]{20,})/gi),
+    ...textContent.matchAll(/(?:PAYLOAD|DATA|B64)=["']([A-Za-z0-9+/=]{30,})["']/gi),
+  ];
+  for (const m of b64Matches) {
+    let candidate = m[1];
+    let rounds = 0;
+    let decodedBuf = null;
+
+    while (rounds < 4 && candidate) {
+      try {
+        decodedBuf = Buffer.from(candidate, 'base64');
+        rounds++;
+        // Check if decompresses
+        const decomp = tryDecompress(decodedBuf);
+        if (decomp) decodedBuf = decomp;
+
+        if (isElfBinary(decodedBuf)) {
+          const strings = extractStringsFromBinary(decodedBuf);
+          return {
+            fileName,
+            isEncrypted: true,
+            decrypted: true,
+            method: `Base64 De-obfuscator (${rounds} round${rounds > 1 ? 's' : ''}) -> ELF Binary`,
+            entropy,
+            extractedSnippet: strings.slice(0, 10).join('; '),
+            decryptedBytes: decodedBuf,
+            recoveredCommands: strings.filter((s) => /rm\b|chmod\b|dd\b|sh\b|su\b/i.test(s)),
+            details: `Successfully de-obfuscated Base64 layers (${rounds} rounds) to ELF binary.`,
+          };
+        }
+        if (isPrintableScript(decodedBuf)) {
+          const text = decodedBuf.toString('utf-8');
+          // Check if nested base64
+          const nested = text.match(/echo\s+["']?([A-Za-z0-9+/=]{20,})["']?\s*\|\s*base64/i);
+          if (nested) {
+            candidate = nested[1];
+            continue;
+          }
+          return {
+            fileName,
+            isEncrypted: true,
+            decrypted: true,
+            method: `Base64 De-obfuscator (${rounds} round${rounds > 1 ? 's' : ''}) -> Shell Script`,
+            entropy,
+            extractedSnippet: text.slice(0, 150),
+            decryptedText: text,
+            details: `Successfully de-obfuscated Base64 script wrapper (${rounds} rounds).`,
+          };
+        }
+        candidate = null;
+      } catch (e) {
+        break;
+      }
+    }
+  }
+
+  // 3. Hex escape stream decoding (e.g. \x7f\x45\x4c\x46 or long hex strings)
+  const hexMatches = [
+    ...textContent.matchAll(/printf\s+["']((?:\\x[0-9a-fA-F]{2}){10,})["']/gi),
+    ...textContent.matchAll(/(?:HEX|SHELLCODE)=["']((?:[0-9a-fA-F]{2}){16,})["']/gi),
+  ];
+  for (const hm of hexMatches) {
+    try {
+      const rawHex = hm[1].replace(/\\x/g, '');
+      const hexBuf = Buffer.from(rawHex, 'hex');
+      const decomp = tryDecompress(hexBuf) || hexBuf;
+      if (isElfBinary(decomp)) {
+        const strings = extractStringsFromBinary(decomp);
+        return {
+          fileName,
+          isEncrypted: true,
+          decrypted: true,
+          method: 'Hex Escape Stream Decoder -> ELF Binary',
+          entropy,
+          extractedSnippet: strings.slice(0, 10).join('; '),
+          decryptedBytes: decomp,
+          recoveredCommands: strings.filter((s) => /rm\b|chmod\b|dd\b|sh\b|su\b/i.test(s)),
+          details: 'Successfully decoded hex-escaped shellcode into ELF binary.',
+        };
+      }
+      if (isPrintableScript(decomp)) {
+        const text = decomp.toString('utf-8');
+        return {
+          fileName,
+          isEncrypted: true,
+          decrypted: true,
+          method: 'Hex Escape Stream Decoder -> Shell Script',
+          entropy,
+          extractedSnippet: text.slice(0, 150),
+          decryptedText: text,
+          details: 'Successfully decoded hex-escaped script.',
+        };
+      }
+    } catch (e) {}
+  }
+
+  // 4. Direct Decompression attempt (in case payload is raw gzip/zlib)
+  const directDecomp = tryDecompress(buf);
+  if (directDecomp) {
+    if (isElfBinary(directDecomp)) {
+      const strings = extractStringsFromBinary(directDecomp);
+      return {
+        fileName,
+        isEncrypted: true,
+        decrypted: true,
+        method: 'Direct Compression Unpacker (Gzip/Deflate) -> ELF Binary',
+        entropy,
+        extractedSnippet: strings.slice(0, 10).join('; '),
+        decryptedBytes: directDecomp,
+        recoveredCommands: strings.filter((s) => /rm\b|chmod\b|dd\b|sh\b|su\b/i.test(s)),
+        details: 'Successfully decompressed compressed binary payload.',
+      };
+    }
+    if (isPrintableScript(directDecomp)) {
+      const text = directDecomp.toString('utf-8');
+      return {
+        fileName,
+        isEncrypted: true,
+        decrypted: true,
+        method: 'Direct Compression Unpacker (Gzip/Deflate) -> Shell Script',
+        entropy,
+        extractedSnippet: text.slice(0, 150),
+        decryptedText: text,
+        details: 'Successfully decompressed compressed script.',
+      };
+    }
+  }
+
+  // 5. Single-byte XOR brute force (all 255 keys)
   const xor = trySingleByteXor(buf);
   if (xor) {
     const keyHex = `0x${xor.key.toString(16).toUpperCase().padStart(2, '0')}`;
@@ -941,12 +1245,12 @@ function attemptDeepDecryption(fileName, rawContent, contextScripts = '') {
         fileName,
         isEncrypted: true,
         decrypted: true,
-        method: `Single-byte XOR Brute-Force (Key: ${keyHex})`,
+        method: `Single-byte XOR Brute-Force (Key: ${keyHex}) -> ELF Binary`,
         entropy,
         extractedSnippet: strings.slice(0, 10).join('; '),
         decryptedBytes: xor.decryptedBytes,
         recoveredCommands: strings.filter((s) => /rm\b|chmod\b|dd\b|sh\b|su\b/i.test(s)),
-        details: `Successfully decrypted! Recovered ELF binary using key ${keyHex}. Auditing extracted binary strings.`,
+        details: `Successfully decrypted! Recovered ELF binary using single-byte XOR key ${keyHex}.`,
       };
     } else {
       const text = xor.decryptedBytes.toString('utf-8');
@@ -954,52 +1258,119 @@ function attemptDeepDecryption(fileName, rawContent, contextScripts = '') {
         fileName,
         isEncrypted: true,
         decrypted: true,
-        method: `Single-byte XOR Brute-Force (Key: ${keyHex})`,
+        method: `Single-byte XOR Brute-Force (Key: ${keyHex}) -> Shell Script`,
         entropy,
         extractedSnippet: text.slice(0, 150),
         decryptedText: text,
-        details: `Successfully decrypted! Recovered shell script using key ${keyHex}. Audited decrypted commands.`,
+        details: `Successfully decrypted! Recovered shell script using single-byte XOR key ${keyHex}.`,
       };
     }
   }
 
-  // Base64 obfuscation unpacker
-  const b64Match =
-    textContent.match(/echo\s+["']?([A-Za-z0-9+/=]{20,})["']?\s*\|\s*base64\s+-d/i) ||
-    textContent.match(/base64\s+-d\s+<<<["']?\s*([A-Za-z0-9+/=]{20,})/i);
-  if (b64Match) {
-    try {
-      const decoded = Buffer.from(b64Match[1], 'base64');
-      if (isElfBinary(decoded)) {
-        const strings = extractStringsFromBinary(decoded);
+  // 6. Multi-Byte XOR & RC4 with harvested candidate keys
+  const candidateKeys = extractPotentialKeys(contextScripts + '\n' + textContent, metadata);
+  for (const candKey of candidateKeys) {
+    // Try multi-byte XOR
+    const xorOut = multiByteXor(buf, candKey);
+    if (xorOut) {
+      const decomp = tryDecompress(xorOut) || xorOut;
+      if (isElfBinary(decomp)) {
+        const strings = extractStringsFromBinary(decomp);
         return {
           fileName,
           isEncrypted: true,
           decrypted: true,
-          method: 'Base64 Obfuscation Unpacker -> ELF Binary',
+          method: `Multi-byte XOR Decryption (Key: "${candKey}") -> ELF Binary`,
           entropy,
           extractedSnippet: strings.slice(0, 10).join('; '),
-          decryptedBytes: decoded,
+          decryptedBytes: decomp,
           recoveredCommands: strings.filter((s) => /rm\b|chmod\b|dd\b|sh\b|su\b/i.test(s)),
-          details: 'Successfully decoded Base64 wrapper to ELF binary.',
+          details: `Successfully decrypted with candidate key "${candKey}"! Recovered ELF binary.`,
         };
-      } else if (isPrintableScript(decoded)) {
-        const text = decoded.toString('utf-8');
+      }
+      if (isPrintableScript(decomp)) {
+        const text = decomp.toString('utf-8');
         return {
           fileName,
           isEncrypted: true,
           decrypted: true,
-          method: 'Base64 Obfuscation Unpacker -> Shell Script',
+          method: `Multi-byte XOR Decryption (Key: "${candKey}") -> Shell Script`,
           entropy,
           extractedSnippet: text.slice(0, 150),
           decryptedText: text,
-          details: 'Successfully decoded Base64 script wrapper. Audited decrypted payload.',
+          details: `Successfully decrypted with candidate key "${candKey}"! Recovered shell script.`,
         };
       }
-    } catch (e) {}
+    }
+
+    // Try RC4
+    const rc4Out = rc4Decrypt(candKey, buf);
+    if (rc4Out) {
+      const decomp = tryDecompress(rc4Out) || rc4Out;
+      if (isElfBinary(decomp)) {
+        const strings = extractStringsFromBinary(decomp);
+        return {
+          fileName,
+          isEncrypted: true,
+          decrypted: true,
+          method: `RC4 Stream Decryption (Key: "${candKey}") -> ELF Binary`,
+          entropy,
+          extractedSnippet: strings.slice(0, 10).join('; '),
+          decryptedBytes: decomp,
+          recoveredCommands: strings.filter((s) => /rm\b|chmod\b|dd\b|sh\b|su\b/i.test(s)),
+          details: `Successfully decrypted with RC4 stream cipher using key "${candKey}"!`,
+        };
+      }
+      if (isPrintableScript(decomp)) {
+        const text = decomp.toString('utf-8');
+        return {
+          fileName,
+          isEncrypted: true,
+          decrypted: true,
+          method: `RC4 Stream Decryption (Key: "${candKey}") -> Shell Script`,
+          entropy,
+          extractedSnippet: text.slice(0, 150),
+          decryptedText: text,
+          details: `Successfully decrypted with RC4 stream cipher using key "${candKey}"!`,
+        };
+      }
+    }
+
+    // Try OpenSSL AES-256-CBC if Salted__ header
+    const aesOut = tryOpenSslAesDecrypt(buf, candKey);
+    if (aesOut) {
+      const decomp = tryDecompress(aesOut) || aesOut;
+      if (isElfBinary(decomp)) {
+        const strings = extractStringsFromBinary(decomp);
+        return {
+          fileName,
+          isEncrypted: true,
+          decrypted: true,
+          method: `OpenSSL AES-256-CBC Decryption (Key: "${candKey}") -> ELF Binary`,
+          entropy,
+          extractedSnippet: strings.slice(0, 10).join('; '),
+          decryptedBytes: decomp,
+          recoveredCommands: strings.filter((s) => /rm\b|chmod\b|dd\b|sh\b|su\b/i.test(s)),
+          details: `Successfully decrypted OpenSSL AES-256-CBC container using key "${candKey}"!`,
+        };
+      }
+      if (isPrintableScript(decomp)) {
+        const text = decomp.toString('utf-8');
+        return {
+          fileName,
+          isEncrypted: true,
+          decrypted: true,
+          method: `OpenSSL AES-256-CBC Decryption (Key: "${candKey}") -> Shell Script`,
+          entropy,
+          extractedSnippet: text.slice(0, 150),
+          decryptedText: text,
+          details: `Successfully decrypted OpenSSL AES-256-CBC container using key "${candKey}"!`,
+        };
+      }
+    }
   }
 
-  // High entropy / OpenSSL Salted
+  // 7. Check if file is an un-decrypted encrypted payload or high-entropy binary
   const isOpenSslSalted =
     buf.length >= 16 &&
     buf[0] === 0x53 && buf[1] === 0x61 && buf[2] === 0x6c && buf[3] === 0x74 &&
@@ -1007,7 +1378,7 @@ function attemptDeepDecryption(fileName, rawContent, contextScripts = '') {
 
   const isSuspiciousBinary =
     isOpenSslSalted ||
-    entropy >= 7.1 ||
+    entropy >= 7.0 ||
     fileName.endsWith('.enc') ||
     fileName.endsWith('.bin') ||
     (fileName.includes('system/bin') && !isElfBinary(buf) && !isPrintableScript(buf));
@@ -1019,8 +1390,8 @@ function attemptDeepDecryption(fileName, rawContent, contextScripts = '') {
       decrypted: false,
       entropy,
       details: isOpenSslSalted
-        ? 'OpenSSL AES Encrypted Binary (Salted__). Decryption key not present in module.'
-        : `Encrypted binary payload detected (Entropy: ${entropy.toFixed(2)}/8.0). Decryption key not present.`,
+        ? 'OpenSSL AES Encrypted Container (Salted__). Decryption key could not be recovered from module.'
+        : `Encrypted or packed binary payload detected (Entropy: ${entropy.toFixed(2)}/8.0). Decryption key not found.`,
       unverifiedWarning:
         '⚠️ Result is NOT guaranteed: Encrypted binary could not be decrypted. Complete safety cannot be certified because hidden binary payload cannot be audited.',
     };
@@ -1133,6 +1504,9 @@ async function extractScriptsFromModule(fileName, bufferOrText) {
   // Pre-gather all script texts for decryption password extraction
   let contextScripts = '';
 
+  // Pass 1: Extract all text scripts, configs, and metadata
+  const pendingBinaryEntries = [];
+
   for (const relativePath of Object.keys(zip.files)) {
     const entry = zip.files[relativePath];
     if (entry.dir) continue;
@@ -1147,7 +1521,7 @@ async function extractScriptsFromModule(fileName, bufferOrText) {
         isEncrypted: true,
         decrypted: false,
         details: 'Encrypted ZIP entry detected.',
-        unverifiedWarning: 'Result is NOT guaranteed: Encrypted file inside archive could not be read.',
+        unverifiedWarning: '⚠️ Result is NOT guaranteed: Encrypted file inside archive could not be read.',
       });
       continue;
     }
@@ -1219,35 +1593,51 @@ async function extractScriptsFromModule(fileName, bufferOrText) {
             if (trimmed.startsWith('description=')) metadata.description = trimmed.slice(12).trim();
           }
         }
+
+        // Check if script itself wraps an obfuscated payload or archive
+        if (
+          text.includes('base64 -d') ||
+          text.includes('base64 --decode') ||
+          text.includes('__ARCHIVE_BELOW__') ||
+          text.includes('__PAYLOAD_BEGINS__') ||
+          text.includes('\\x') ||
+          text.includes('openssl enc')
+        ) {
+          pendingBinaryEntries.push({ relativePath, entry, isText: true, text });
+        }
       } catch (err) {
         // Skip unreadable text
       }
-    } else if (isBinary && uncompressedSize < 5000000) {
-      // Best-effort decryption on binary files
-      try {
-        const rawBuf = await entry.async('nodebuffer');
-        const dec = attemptDeepDecryption(relativePath, rawBuf, contextScripts);
-        if (dec.isEncrypted) {
-          binaryDecryption.push(dec);
-          if (dec.decrypted && dec.decryptedText) {
-            scripts.push({
-              path: `[DECRYPTED] ${relativePath}`,
-              content: dec.decryptedText.slice(0, 15000),
-              size: dec.decryptedText.length,
-              type: 'script',
-            });
-          }
-          if (dec.decrypted && dec.recoveredCommands && dec.recoveredCommands.length > 0) {
-            scripts.push({
-              path: `[DECRYPTED_BINARY] ${relativePath}`,
-              content: dec.recoveredCommands.join('\n'),
-              size: 200,
-              type: 'script',
-            });
-          }
-        }
-      } catch (err) {}
+    } else if (uncompressedSize < 8000000) {
+      pendingBinaryEntries.push({ relativePath, entry, isText: false });
     }
+  }
+
+  // Pass 2: Deep decryption across all binaries and obfuscated wrappers using full context
+  for (const item of pendingBinaryEntries) {
+    try {
+      const rawBuf = await item.entry.async('nodebuffer');
+      const dec = attemptDeepDecryption(item.relativePath, rawBuf, contextScripts, metadata);
+      if (dec.isEncrypted) {
+        binaryDecryption.push(dec);
+        if (dec.decrypted && dec.decryptedText) {
+          scripts.push({
+            path: `[DECRYPTED] ${item.relativePath}`,
+            content: dec.decryptedText.slice(0, 20000),
+            size: dec.decryptedText.length,
+            type: 'script',
+          });
+        }
+        if (dec.decrypted && dec.recoveredCommands && dec.recoveredCommands.length > 0) {
+          scripts.push({
+            path: `[DECRYPTED_BINARY] ${item.relativePath}`,
+            content: dec.recoveredCommands.join('\n'),
+            size: dec.recoveredCommands.join('\n').length,
+            type: 'script',
+          });
+        }
+      }
+    } catch (err) {}
   }
 
   const lowerPaths = allFiles.map((f) => f.path.toLowerCase());
@@ -1278,6 +1668,7 @@ async function extractScriptsFromModule(fileName, bufferOrText) {
 //    ENHANCED: Precision Partition Wipe vs Safe File Deletion, Crucial Chmod Detection & Binary Decryption
 // =======================================================================
 function runDeepHeuristicScanner(scripts, binaryDecryption = []) {
+  const candidateCommands = [];
   const corrupting = [];
   const risky = [];
   const good = [];
@@ -1290,6 +1681,10 @@ function runDeepHeuristicScanner(scripts, binaryDecryption = []) {
     lines.forEach((rawLine, idx) => {
       const line = rawLine.trim();
       if (!line || line.startsWith('#')) return;
+
+      if (line.match(/\b(rm|chmod|dd|wipe|format|mke2fs|setenforce|curl|wget|eval)\b/i)) {
+        candidateCommands.push({ command: line, file: file.path });
+      }
 
       // =================================================================
       // [A] PRECISION FILE & PARTITION DELETION DETECTION
@@ -1537,6 +1932,7 @@ function runDeepHeuristicScanner(scripts, binaryDecryption = []) {
     corruptingCommands: corrupting,
     riskyCommands: risky,
     goodCommands: good,
+    candidateCommands,
     sepolicyIssues,
     deletionLog,
     chmodLog,
@@ -1611,8 +2007,19 @@ ${metaText || 'None provided'}
 MODULE SCRIPTS AUDITED:
 ${formattedScripts}
 
+CANDIDATE COMMANDS DETECTED (MUST DEEPLY ANALYZE IN FULL SCRIPT CONTEXT):
+${JSON.stringify(heuristicResult.candidateCommands || [], null, 2)}
+
 BINARY DECRYPTION INSPECTION FINDINGS:
 ${JSON.stringify(binaryDecryption || [], null, 2)}
+
+SPECIFIC INSTRUCTION FOR COMMAND ANALYSIS:
+- The local pattern scanner detected candidate commands above.
+- You MUST analyze the surrounding code and determine WHAT EACH COMMAND ACTUALLY DOES in this specific module.
+- For each command you report, clearly explain in everyday words what it does.
+- If it is safe cleanup (deleting temporary files, cache, dalvik-cache, logs, or files in the module's own folder $MODDIR), or safe setup (chmod 755/644 on module files), explain why it is safe in "deletionAssessment" or "chmodAssessment" and place it in "goodCommands". DO NOT flag it as high risk or put it in "corruptingCommands"!
+- ONLY put a command in "corruptingCommands" if it ACTUALLY wipes an entire partition (like /system, /data, /vendor, /boot) or deletes core Android boot binaries, causing an unbootable phone or bootloop!
+- Accurately determine the true verdict ('SAFE', 'CAUTION', 'DANGEROUS', 'MALICIOUS_BRICK_RISK') and riskScore based on your deep understanding of the module!
 
 AUDIT SECTIONS YOU MUST WRITE BASED 100% ON YOUR READING OF THE CODE:
 1. "whatThisModuleDoes": Thorough explanation written by you detailing what this module ACTUALLY attempts to do in everyday words.
@@ -1806,25 +2213,18 @@ Return a JSON object conforming strictly to the requested schema.`;
     }
   }
 
-  // Merge Heuristics: never drop a brick command found by static scanner!
+  // AI vs Offline Heuristic resolution
   if (!aiResult) {
-    console.log('🛡️ Engaging RootGuard Deep Heuristic Engine (100% offline accuracy safety net).');
+    console.log('🛡️ Engaging RootGuard Deep Heuristic Engine (100% offline accuracy fallback).');
     aiResult = heuristicResult;
   } else {
-    const corrupting = [...(aiResult.corruptingCommands || [])];
-    for (const h of heuristicResult.corruptingCommands) {
-      if (!corrupting.some((c) => c.command === h.command)) {
-        corrupting.push(h);
-      }
-    }
-    aiResult.corruptingCommands = corrupting;
-
-    if (corrupting.length > 0) {
+    // If AI's contextual analysis confirmed genuine bricking/partition-wipe commands:
+    if (aiResult.corruptingCommands && aiResult.corruptingCommands.length > 0) {
       aiResult.verdict = 'MALICIOUS_BRICK_RISK';
       aiResult.riskScore = Math.max(aiResult.riskScore || 0, 90);
     }
 
-    // If unverified encrypted binaries exist, safety is not guaranteed
+    // If unverified encrypted binaries exist, safety cannot be guaranteed
     const hasUnverifiedBinary = (binaryDecryption || []).some((b) => !b.decrypted);
     if (hasUnverifiedBinary && aiResult.verdict === 'SAFE') {
       aiResult.verdict = 'CAUTION';
@@ -1960,11 +2360,11 @@ function formatReportHtml(fileName, audit, quotaRemaining, isOwner, fileBreakdow
   const replyMarkup = {
     inline_keyboard: [
       [
-        { text: '📖 Explain in Simpler Words', callback_data: `eli5:${scanId}` },
-        { text: '💡 What Should I Do?', callback_data: `advice:${scanId}` },
+        { text: '💬 Ask About This Module', callback_data: `ask:${scanId}` },
+        { text: '📜 View Module Code', callback_data: `code:${scanId}:0` },
       ],
       [
-        { text: '📜 View Flagged Code', callback_data: `code:${scanId}` },
+        { text: '📖 Explain in Simpler Words', callback_data: `eli5:${scanId}` },
         { text: '🚨 Bootloop Rescue', callback_data: `recovery` },
       ],
     ],
@@ -2000,7 +2400,9 @@ async function handleCallbackQuery(cq) {
     return await sendTelegramMessage(chatId, recText, messageId);
   }
 
-  const [action, scanId] = data.split(':');
+  const parts = data.split(':');
+  const action = parts[0];
+  const scanId = parts[1];
   const cached = dbGetScanCache(scanId);
 
   if (!cached) {
@@ -2023,10 +2425,17 @@ async function handleCallbackQuery(cq) {
         `⚡ <i>RootGuard • made by @toshitzz</i>`;
       return await sendTelegramMessage(chatId, fallbackAdvice, messageId);
     }
-    if (action === 'code') {
+    if (action === 'code' || action === 'fcode') {
       return await sendTelegramMessage(
         chatId,
         `📜 <i>Script command details are cleared after file cleanup. To inspect code specifics, simply re-upload your module file!</i>\n\n⚡ <i>made by @toshitzz</i>`,
+        messageId
+      );
+    }
+    if (action === 'ask') {
+      return await sendTelegramMessage(
+        chatId,
+        `💬 <i>Session expired. Please re-upload your module file to ask RootGuard AI questions about it!</i>\n\n⚡ <i>made by @toshitzz</i>`,
         messageId
       );
     }
@@ -2034,6 +2443,21 @@ async function handleCallbackQuery(cq) {
   }
 
   const audit = cached.audit;
+
+  if (action === 'ask') {
+    userQuestionSessions.set(String(chatId), { scanId, fileName: cached.fileName, timestamp: Date.now() });
+    const askPromptText = `💬 <b>Ask RootGuard AI about:</b> <code>${escapeHtml(cached.fileName)}</code>\n` +
+      `━━━━━━━━━━━━━━━━━━━━━\n` +
+      `Send any question in this chat! RootGuard AI will review the module's code and answer you directly.\n\n` +
+      `<b>Example Questions:</b>\n` +
+      `• <i>"Does this module touch my boot partition or cause bootloops?"</i>\n` +
+      `• <i>"What does the customize.sh script do?"</i>\n` +
+      `• <i>"Does it delete any of my personal files or apps?"</i>\n` +
+      `• <i>"Will this drain my battery or cause heating?"</i>\n\n` +
+      `<i>Type your question below, or type /cancel to stop.</i>\n` +
+      `⚡ <i>RootGuard • made by @toshitzz</i>`;
+    return await sendTelegramMessage(chatId, askPromptText, messageId);
+  }
 
   if (action === 'eli5') {
     let eli5Text = `📖 <b>Super Simple Explanation (In Easy Words):</b>\n\n`;
@@ -2073,20 +2497,59 @@ async function handleCallbackQuery(cq) {
     return await sendTelegramMessage(chatId, adviceText, messageId);
   }
 
-  if (action === 'code') {
-    let codeText = `📜 <b>Flagged Script Commands:</b>\n\n`;
-    const flags = [...(audit.corruptingCommands || []), ...(audit.riskyCommands || [])];
+  if (action === 'code' || action === 'fcode') {
+    const scripts = cached.scripts || [];
+    if (scripts.length === 0) {
+      let codeText = `📜 <b>Flagged Script Commands:</b>\n\n`;
+      const flags = [...(audit.corruptingCommands || []), ...(audit.riskyCommands || [])];
 
-    if (flags.length === 0) {
-      codeText += `✅ <i>No dangerous partition wipes or critical chmod commands were flagged in this file!</i>\n\n`;
-    } else {
-      flags.slice(0, 6).forEach((f) => {
-        codeText += `• <code>${escapeHtml(f.command)}</code>\n  👉 <i>${escapeHtml(f.explanation || 'Flagged operation')}</i>\n\n`;
-      });
+      if (flags.length === 0) {
+        codeText += `✅ <i>No dangerous partition wipes or critical chmod commands were flagged in this file!</i>\n\n`;
+      } else {
+        flags.slice(0, 6).forEach((f) => {
+          codeText += `• <code>${escapeHtml(f.command)}</code>\n  👉 <i>${escapeHtml(f.explanation || 'Flagged operation')}</i>\n\n`;
+        });
+      }
+      codeText += `⚡ <i>RootGuard • made by @toshitzz</i>`;
+      return await sendTelegramMessage(chatId, codeText, messageId);
     }
-    codeText += `⚡ <i>RootGuard • made by @toshitzz</i>`;
 
-    return await sendTelegramMessage(chatId, codeText, messageId);
+    const fileIdx = parseInt(parts[2] || '0', 10) || 0;
+    const safeIdx = Math.max(0, Math.min(scripts.length - 1, fileIdx));
+    const currentScript = scripts[safeIdx];
+
+    let codeText = `📜 <b>Module Code Inspector:</b> <code>${escapeHtml(cached.fileName)}</code>\n`;
+    codeText += `━━━━━━━━━━━━━━━━━━━━━\n`;
+    codeText += `<b>File ${safeIdx + 1} of ${scripts.length}:</b> <code>${escapeHtml(currentScript.path)}</code> (${currentScript.size || currentScript.content.length} bytes)\n\n`;
+
+    const preview = currentScript.content.slice(0, 1600);
+    codeText += `<pre><code>${escapeHtml(preview)}</code></pre>\n`;
+    if (currentScript.content.length > 1600) {
+      codeText += `\n<i>... (${currentScript.content.length - 1600} more characters truncated for Telegram view)</i>\n`;
+    }
+
+    const navButtons = [];
+    if (safeIdx > 0) {
+      const prevName = scripts[safeIdx - 1].path.split('/').pop();
+      navButtons.push({ text: `⬅️ ${prevName}`, callback_data: `fcode:${scanId}:${safeIdx - 1}` });
+    }
+    if (safeIdx < scripts.length - 1) {
+      const nextName = scripts[safeIdx + 1].path.split('/').pop();
+      navButtons.push({ text: `${nextName} ➡️`, callback_data: `fcode:${scanId}:${safeIdx + 1}` });
+    }
+
+    const inlineKeyboard = [];
+    if (navButtons.length > 0) {
+      inlineKeyboard.push(navButtons);
+    }
+    inlineKeyboard.push([
+      { text: '💬 Ask AI About This Script', callback_data: `ask:${scanId}` },
+      { text: '📖 Simpler Explanation', callback_data: `eli5:${scanId}` },
+    ]);
+
+    codeText += `\n⚡ <i>RootGuard • made by @toshitzz</i>`;
+
+    return await sendTelegramMessage(chatId, codeText, messageId, { inline_keyboard: inlineKeyboard });
   }
 }
 
@@ -2337,7 +2800,7 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
           duration_ms: 1200,
         });
 
-        dbSaveScanCache(scanId, fileName, finalAudit);
+        dbSaveScanCache(scanId, fileName, finalAudit, scripts);
 
         const { text: reportHtml, replyMarkup } = formatReportHtml(
           fileName,
@@ -2646,7 +3109,7 @@ async function processModuleAuditJob(chatId, rawUserId, msg, fileName) {
     });
 
     const quotaInfo = dbGetUserQuota(cleanUserId);
-    dbSaveScanCache(scanId, fileName, audit);
+    dbSaveScanCache(scanId, fileName, audit, scripts);
 
     const { text: reportHtml, replyMarkup } = formatReportHtml(
       fileName,
@@ -2714,10 +3177,86 @@ async function handleUpdate(update) {
   const text = (msg.text || '').trim();
 
   if (text.startsWith('/')) {
+    if (text.toLowerCase() === '/cancel') {
+      if (userQuestionSessions.has(String(chatId))) {
+        userQuestionSessions.delete(String(chatId));
+        return await sendTelegramMessage(chatId, `✅ <i>Q&A session ended. Upload another module file or type /help.</i>`, msg.message_id);
+      }
+    }
     const firstWord = text.split(/\s+/)[0];
     const command = firstWord.toLowerCase().split('@')[0];
     const args = text.slice(firstWord.length).trim();
     return await handleCommand(chatId, rawUserId, command, args, msg.message_id);
+  }
+
+  // Check if user is asking a question about a scanned module
+  const qSession = userQuestionSessions.get(String(chatId));
+  if (qSession && text) {
+    const cached = dbGetScanCache(qSession.scanId);
+    if (!cached) {
+      userQuestionSessions.delete(String(chatId));
+      return await sendTelegramMessage(
+        chatId,
+        `⚠️ <i>Module session expired. Please re-upload your module file to ask questions!</i>\n\n⚡ <i>made by @toshitzz</i>`,
+        msg.message_id
+      );
+    }
+
+    sendChatAction(chatId, 'typing').catch(() => {});
+    const ai = getAi();
+    if (!ai) {
+      return await sendTelegramMessage(chatId, `⚠️ AI Engine is offline (GEMINI_API_KEY missing).`, msg.message_id);
+    }
+
+    const scriptsContext = (cached.scripts || [])
+      .slice(0, 8)
+      .map((s) => `--- File: ${s.path} ---\n${s.content.slice(0, 4000)}`)
+      .join('\n\n');
+
+    const questionPrompt = `You are RootGuard AI, an expert Android root security engineer, answering a user's question about an Android Magisk/KernelSU root module they scanned.
+
+Target Module: ${cached.fileName}
+Overall Verdict: ${cached.audit?.verdict || 'UNKNOWN'} (Risk Score: ${cached.audit?.riskScore || 0}/100)
+Summary: ${cached.audit?.summary || ''}
+What this module does: ${cached.audit?.whatThisModuleDoes || ''}
+Partition Deletion Assessment: ${cached.audit?.deletionAssessment || ''}
+Chmod Permission Assessment: ${cached.audit?.chmodAssessment || ''}
+
+Module Source Code / Scripts Audited:
+${scriptsContext || 'No script contents available.'}
+
+User's Question: "${text}"
+
+Instructions:
+1. Answer the user directly, honestly, and in clear, plain everyday language.
+2. Ground your answer completely in the module's actual scripts and audit data provided above.
+3. If the user asks whether it is safe, wipes partitions, causes bootloops, drains battery, or asks what a specific line/file does, explain clearly.
+4. Keep the answer helpful, friendly, and under 300 words. Format with Telegram HTML (<b>, <i>, <code>).`;
+
+    try {
+      const qModel = (process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim();
+      const answerRes = await ai.models.generateContent({
+        model: qModel,
+        contents: questionPrompt,
+      });
+      const answerText = answerRes.text ? answerRes.text.trim() : "I couldn't generate an answer at this moment.";
+      return await sendTelegramMessage(
+        chatId,
+        `💬 <b>RootGuard AI Answer:</b>\n` +
+        `📦 <i>Module: <code>${escapeHtml(cached.fileName)}</code></i>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `${answerText}\n\n` +
+        `💡 <i>You can ask another question, or type /cancel to finish.</i>\n` +
+        `⚡ <i>RootGuard • made by @toshitzz</i>`,
+        msg.message_id
+      );
+    } catch (err) {
+      return await sendTelegramMessage(
+        chatId,
+        `⚠️ <i>Could not complete AI answer: ${escapeHtml(err.message)}</i>`,
+        msg.message_id
+      );
+    }
   }
 
   if (msg.document) {
