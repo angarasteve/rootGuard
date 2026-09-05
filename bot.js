@@ -806,8 +806,235 @@ function getTimeUntilMidnightUtc() {
 }
 
 // =======================================================================
-// 5. Script & Archive Inspection
+// 5. Script & Archive Inspection with Binary Decryption Engine
 // =======================================================================
+function calculateEntropy(buf) {
+  if (!buf || buf.length === 0) return 0;
+  const frequencies = new Map();
+  for (let i = 0; i < buf.length; i++) {
+    const byte = buf[i];
+    frequencies.set(byte, (frequencies.get(byte) || 0) + 1);
+  }
+  let entropy = 0;
+  for (const count of frequencies.values()) {
+    const p = count / buf.length;
+    entropy -= p * Math.log2(p);
+  }
+  return Number(entropy.toFixed(3));
+}
+
+function isPrintableScript(buf) {
+  if (!buf || buf.length === 0) return false;
+  let printableCount = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    if ((b >= 32 && b <= 126) || b === 9 || b === 10 || b === 13) {
+      printableCount++;
+    }
+  }
+  return printableCount / buf.length > 0.85;
+}
+
+function isElfBinary(buf) {
+  return (
+    buf &&
+    buf.length >= 4 &&
+    buf[0] === 0x7f &&
+    buf[1] === 0x45 &&
+    buf[2] === 0x4c &&
+    buf[3] === 0x46
+  );
+}
+
+function extractStringsFromBinary(buf, minLen = 4) {
+  const strings = [];
+  let current = [];
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    if (b >= 32 && b <= 126) {
+      current.push(b);
+    } else {
+      if (current.length >= minLen) {
+        strings.push(String.fromCharCode(...current));
+      }
+      current = [];
+    }
+  }
+  if (current.length >= minLen) {
+    strings.push(String.fromCharCode(...current));
+  }
+  return strings;
+}
+
+function extractPotentialKeys(contextText = '') {
+  const keys = new Set(['root', 'magisk', 'kernelsu', 'android', '123456', 'toshitzz', 'module']);
+  if (!contextText) return Array.from(keys);
+
+  const patterns = [
+    /(?:key|pass|password|secret)\s*=\s*["']([^"']+)["']/gi,
+    /-k\s+["']?([a-zA-Z0-9_\-\.\@\$]+)["']?/gi,
+    /-pass\s+(?:pass:)?["']?([^"'\s]+)["']?/gi,
+    /openssl\s+enc\s+.*-k\s+([^\s]+)/gi,
+  ];
+  for (const pat of patterns) {
+    let match;
+    while ((match = pat.exec(contextText)) !== null) {
+      if (match[1] && match[1].length >= 2) {
+        keys.add(match[1].trim());
+      }
+    }
+  }
+  return Array.from(keys);
+}
+
+function trySingleByteXor(buf) {
+  if (!buf || buf.length < 4) return null;
+  for (let key = 1; key <= 255; key++) {
+    if (
+      (buf[0] ^ key) === 0x7f &&
+      (buf[1] ^ key) === 0x45 &&
+      (buf[2] ^ key) === 0x4c &&
+      (buf[3] ^ key) === 0x46
+    ) {
+      const decrypted = Buffer.alloc(buf.length);
+      for (let i = 0; i < buf.length; i++) {
+        decrypted[i] = buf[i] ^ key;
+      }
+      return { key, decryptedBytes: decrypted, type: 'ELF' };
+    }
+    if ((buf[0] ^ key) === 0x23 && (buf[1] ^ key) === 0x21) {
+      const decrypted = Buffer.alloc(buf.length);
+      for (let i = 0; i < buf.length; i++) {
+        decrypted[i] = buf[i] ^ key;
+      }
+      if (isPrintableScript(decrypted)) {
+        return { key, decryptedBytes: decrypted, type: 'SCRIPT' };
+      }
+    }
+  }
+  return null;
+}
+
+function attemptDeepDecryption(fileName, rawContent, contextScripts = '') {
+  const buf = Buffer.isBuffer(rawContent) ? rawContent : Buffer.from(rawContent);
+  const entropy = calculateEntropy(buf);
+  const textContent = typeof rawContent === 'string' ? rawContent : buf.slice(0, 10000).toString('utf-8');
+
+  // Check if plain script
+  if (isPrintableScript(buf) && !textContent.includes('base64 -d') && !textContent.includes('eval "$(')) {
+    return {
+      fileName,
+      isEncrypted: false,
+      decrypted: false,
+      entropy,
+      details: 'Standard readable script or text file.',
+    };
+  }
+
+  // Single-byte XOR brute force
+  const xor = trySingleByteXor(buf);
+  if (xor) {
+    const keyHex = `0x${xor.key.toString(16).toUpperCase().padStart(2, '0')}`;
+    if (xor.type === 'ELF') {
+      const strings = extractStringsFromBinary(xor.decryptedBytes);
+      return {
+        fileName,
+        isEncrypted: true,
+        decrypted: true,
+        method: `Single-byte XOR Brute-Force (Key: ${keyHex})`,
+        entropy,
+        extractedSnippet: strings.slice(0, 10).join('; '),
+        decryptedBytes: xor.decryptedBytes,
+        recoveredCommands: strings.filter((s) => /rm\b|chmod\b|dd\b|sh\b|su\b/i.test(s)),
+        details: `Successfully decrypted! Recovered ELF binary using key ${keyHex}. Auditing extracted binary strings.`,
+      };
+    } else {
+      const text = xor.decryptedBytes.toString('utf-8');
+      return {
+        fileName,
+        isEncrypted: true,
+        decrypted: true,
+        method: `Single-byte XOR Brute-Force (Key: ${keyHex})`,
+        entropy,
+        extractedSnippet: text.slice(0, 150),
+        decryptedText: text,
+        details: `Successfully decrypted! Recovered shell script using key ${keyHex}. Audited decrypted commands.`,
+      };
+    }
+  }
+
+  // Base64 obfuscation unpacker
+  const b64Match =
+    textContent.match(/echo\s+["']?([A-Za-z0-9+/=]{20,})["']?\s*\|\s*base64\s+-d/i) ||
+    textContent.match(/base64\s+-d\s+<<<["']?\s*([A-Za-z0-9+/=]{20,})/i);
+  if (b64Match) {
+    try {
+      const decoded = Buffer.from(b64Match[1], 'base64');
+      if (isElfBinary(decoded)) {
+        const strings = extractStringsFromBinary(decoded);
+        return {
+          fileName,
+          isEncrypted: true,
+          decrypted: true,
+          method: 'Base64 Obfuscation Unpacker -> ELF Binary',
+          entropy,
+          extractedSnippet: strings.slice(0, 10).join('; '),
+          decryptedBytes: decoded,
+          recoveredCommands: strings.filter((s) => /rm\b|chmod\b|dd\b|sh\b|su\b/i.test(s)),
+          details: 'Successfully decoded Base64 wrapper to ELF binary.',
+        };
+      } else if (isPrintableScript(decoded)) {
+        const text = decoded.toString('utf-8');
+        return {
+          fileName,
+          isEncrypted: true,
+          decrypted: true,
+          method: 'Base64 Obfuscation Unpacker -> Shell Script',
+          entropy,
+          extractedSnippet: text.slice(0, 150),
+          decryptedText: text,
+          details: 'Successfully decoded Base64 script wrapper. Audited decrypted payload.',
+        };
+      }
+    } catch (e) {}
+  }
+
+  // High entropy / OpenSSL Salted
+  const isOpenSslSalted =
+    buf.length >= 16 &&
+    buf[0] === 0x53 && buf[1] === 0x61 && buf[2] === 0x6c && buf[3] === 0x74 &&
+    buf[4] === 0x65 && buf[5] === 0x64 && buf[6] === 0x5f && buf[7] === 0x5f;
+
+  const isSuspiciousBinary =
+    isOpenSslSalted ||
+    entropy >= 7.1 ||
+    fileName.endsWith('.enc') ||
+    fileName.endsWith('.bin') ||
+    (fileName.includes('system/bin') && !isElfBinary(buf) && !isPrintableScript(buf));
+
+  if (isSuspiciousBinary) {
+    return {
+      fileName,
+      isEncrypted: true,
+      decrypted: false,
+      entropy,
+      details: isOpenSslSalted
+        ? 'OpenSSL AES Encrypted Binary (Salted__). Decryption key not present in module.'
+        : `Encrypted binary payload detected (Entropy: ${entropy.toFixed(2)}/8.0). Decryption key not present.`,
+      unverifiedWarning:
+        '⚠️ Result is NOT guaranteed: Encrypted binary could not be decrypted. Complete safety cannot be certified because hidden binary payload cannot be audited.',
+    };
+  }
+
+  return {
+    fileName,
+    isEncrypted: false,
+    decrypted: false,
+    entropy,
+    details: 'Binary or resource file inspected.',
+  };
+}
+
 function isZipEncrypted(bufferOrArray) {
   const buf = Buffer.isBuffer(bufferOrArray) ? bufferOrArray : Buffer.from(bufferOrArray);
   if (!buf || buf.length < 30) return false;
@@ -822,23 +1049,51 @@ function isZipEncrypted(bufferOrArray) {
 
 async function extractScriptsFromModule(fileName, bufferOrText) {
   const isZip = fileName.toLowerCase().endsWith('.zip');
+  const binaryDecryption = [];
 
   if (!isZip) {
     const content = Buffer.isBuffer(bufferOrText) ? bufferOrText.toString('utf-8') : String(bufferOrText);
     const dummyMetadata = { name: fileName, type: 'standalone_sh' };
     const singleScript = [{ path: fileName, content, size: content.length, type: 'script' }];
     const allFiles = [{ path: fileName, size: content.length, isScript: true, isConfig: false, isSystem: false, isBinary: false }];
+
+    // Also check standalone script for embedded obfuscation/decryption
+    const dec = attemptDeepDecryption(fileName, bufferOrText, content);
+    if (dec.isEncrypted) {
+      binaryDecryption.push(dec);
+      if (dec.decrypted && dec.decryptedText) {
+        singleScript.push({ path: `[DECRYPTED] ${fileName}`, content: dec.decryptedText, size: dec.decryptedText.length, type: 'script' });
+      }
+    }
+
     return {
       scripts: singleScript,
       metadata: dummyMetadata,
       fileCount: 1,
       allFiles,
       fileBreakdown: { total: 1, scripts: 1, configs: 0, systemFiles: 0, binaries: 0 },
+      binaryDecryption,
     };
   }
 
   if (Buffer.isBuffer(bufferOrText) && isZipEncrypted(bufferOrText)) {
-    throw new Error('ENCRYPTED_ZIP');
+    binaryDecryption.push({
+      fileName,
+      isEncrypted: true,
+      decrypted: false,
+      entropy: calculateEntropy(bufferOrText),
+      details: 'Entire ZIP archive is password-protected or encrypted.',
+      unverifiedWarning:
+        '⚠️ Result is NOT guaranteed: Entire ZIP archive is password-protected/encrypted and cannot be unpacked. Safety cannot be certified.',
+    });
+    return {
+      scripts: [{ path: 'encrypted_archive.zip', content: '# Encrypted archive', size: 0, type: 'script' }],
+      metadata: { name: fileName, type: 'encrypted_zip' },
+      fileCount: 1,
+      allFiles: [{ path: fileName, size: bufferOrText.length, isScript: false, isConfig: false, isSystem: false, isBinary: true }],
+      fileBreakdown: { total: 1, scripts: 0, configs: 0, systemFiles: 0, binaries: 1 },
+      binaryDecryption,
+    };
   }
 
   let zip;
@@ -847,7 +1102,21 @@ async function extractScriptsFromModule(fileName, bufferOrText) {
   } catch (loadErr) {
     const msg = (loadErr.message || '').toLowerCase();
     if (msg.includes('encrypt') || msg.includes('password') || msg.includes('unsupported')) {
-      throw new Error('ENCRYPTED_ZIP');
+      binaryDecryption.push({
+        fileName,
+        isEncrypted: true,
+        decrypted: false,
+        details: 'Encrypted ZIP archive.',
+        unverifiedWarning: '⚠️ Result is NOT guaranteed: Encrypted ZIP archive could not be unpacked.',
+      });
+      return {
+        scripts: [{ path: 'encrypted_archive.zip', content: '# Encrypted archive', size: 0, type: 'script' }],
+        metadata: { name: fileName, type: 'encrypted_zip' },
+        fileCount: 1,
+        allFiles: [{ path: fileName, size: bufferOrText.length, isScript: false, isConfig: false, isSystem: false, isBinary: true }],
+        fileBreakdown: { total: 1, scripts: 0, configs: 0, systemFiles: 0, binaries: 1 },
+        binaryDecryption,
+      };
     }
     throw loadErr;
   }
@@ -861,6 +1130,9 @@ async function extractScriptsFromModule(fileName, bufferOrText) {
   let systemCount = 0;
   let binaryCount = 0;
 
+  // Pre-gather all script texts for decryption password extraction
+  let contextScripts = '';
+
   for (const relativePath of Object.keys(zip.files)) {
     const entry = zip.files[relativePath];
     if (entry.dir) continue;
@@ -868,7 +1140,17 @@ async function extractScriptsFromModule(fileName, bufferOrText) {
 
     const lower = relativePath.toLowerCase();
     const entryData = entry._data || {};
-    if (entryData.isEncrypted) throw new Error('ENCRYPTED_ZIP');
+
+    if (entryData.isEncrypted) {
+      binaryDecryption.push({
+        fileName: relativePath,
+        isEncrypted: true,
+        decrypted: false,
+        details: 'Encrypted ZIP entry detected.',
+        unverifiedWarning: 'Result is NOT guaranteed: Encrypted file inside archive could not be read.',
+      });
+      continue;
+    }
 
     const uncompressedSize = entryData.uncompressedSize || 0;
 
@@ -897,6 +1179,8 @@ async function extractScriptsFromModule(fileName, bufferOrText) {
       lower.endsWith('.so') ||
       lower.endsWith('.apk') ||
       lower.endsWith('.dex') ||
+      lower.endsWith('.bin') ||
+      lower.endsWith('.enc') ||
       lower.startsWith('system/bin/') ||
       lower.startsWith('system/xbin/');
 
@@ -917,6 +1201,7 @@ async function extractScriptsFromModule(fileName, bufferOrText) {
     if (isShellScript || isConfigFile || (!isBinary && uncompressedSize < 100000)) {
       try {
         const text = await entry.async('string');
+        contextScripts += '\n' + text;
         scripts.push({
           path: relativePath,
           content: text.slice(0, 15000),
@@ -937,6 +1222,31 @@ async function extractScriptsFromModule(fileName, bufferOrText) {
       } catch (err) {
         // Skip unreadable text
       }
+    } else if (isBinary && uncompressedSize < 5000000) {
+      // Best-effort decryption on binary files
+      try {
+        const rawBuf = await entry.async('nodebuffer');
+        const dec = attemptDeepDecryption(relativePath, rawBuf, contextScripts);
+        if (dec.isEncrypted) {
+          binaryDecryption.push(dec);
+          if (dec.decrypted && dec.decryptedText) {
+            scripts.push({
+              path: `[DECRYPTED] ${relativePath}`,
+              content: dec.decryptedText.slice(0, 15000),
+              size: dec.decryptedText.length,
+              type: 'script',
+            });
+          }
+          if (dec.decrypted && dec.recoveredCommands && dec.recoveredCommands.length > 0) {
+            scripts.push({
+              path: `[DECRYPTED_BINARY] ${relativePath}`,
+              content: dec.recoveredCommands.join('\n'),
+              size: 200,
+              type: 'script',
+            });
+          }
+        }
+      } catch (err) {}
     }
   }
 
@@ -959,14 +1269,15 @@ async function extractScriptsFromModule(fileName, bufferOrText) {
       systemFiles: systemCount,
       binaries: binaryCount,
     },
+    binaryDecryption,
   };
 }
 
 // =======================================================================
 // 6. Deep Static Heuristic Engine (100% Offline Accuracy Safety Net)
-//    ENHANCED: Precision Partition Wipe vs Safe File Deletion & Crucial Chmod Detection
+//    ENHANCED: Precision Partition Wipe vs Safe File Deletion, Crucial Chmod Detection & Binary Decryption
 // =======================================================================
-function runDeepHeuristicScanner(scripts) {
+function runDeepHeuristicScanner(scripts, binaryDecryption = []) {
   const corrupting = [];
   const risky = [];
   const good = [];
@@ -1148,6 +1459,35 @@ function runDeepHeuristicScanner(scripts) {
     }
   }
 
+  // Binary decryption analysis
+  let decryptionAssessment = '';
+  const unverified = (binaryDecryption || []).filter((b) => !b.decrypted);
+  const decrypted = (binaryDecryption || []).filter((b) => b.decrypted);
+
+  if (unverified.length > 0) {
+    risky.push({
+      command: `[ENCRYPTED_BINARY] ${unverified.map((u) => u.fileName).join(', ')}`,
+      file: unverified[0].fileName,
+      type: 'UNVERIFIED_ENCRYPTED_BINARY',
+      explanation: 'Module contains encrypted or obfuscated binary payloads that could not be decrypted. Complete safety cannot be certified; result is NOT guaranteed.',
+    });
+    decryptionAssessment = `⚠️ Encrypted binary file(s) found (${unverified.map((u) => u.fileName).join(', ')}). Best-effort decryption could not decrypt the binary payload (Entropy: ${unverified[0].entropy || 'high'}). Result is NOT guaranteed safe because hidden code cannot be audited.`;
+  }
+
+  if (decrypted.length > 0) {
+    good.push({
+      command: `[DECRYPTED_BINARY] ${decrypted.map((d) => d.fileName).join(', ')}`,
+      file: decrypted[0].fileName,
+      type: 'DECRYPTED_BINARY_AUDITED',
+      explanation: `Successfully decrypted binary payloads using ${decrypted.map((d) => d.method).join(', ')}. Payload extracted and verified.`,
+    });
+    if (!decryptionAssessment) {
+      decryptionAssessment = `🔓 Successfully decrypted ${decrypted.length} binary payload(s) (${decrypted.map((d) => `${d.fileName} via ${d.method}`).join(', ')}). The revealed code was inspected and audited for security.`;
+    } else {
+      decryptionAssessment += ` Decrypted: ${decrypted.map((d) => d.fileName).join(', ')}.`;
+    }
+  }
+
   let riskScore = 0;
   let verdict = 'SAFE';
 
@@ -1162,6 +1502,12 @@ function runDeepHeuristicScanner(scripts) {
     verdict = 'SAFE';
   }
 
+  // If unverified encrypted binaries exist, safety is not guaranteed
+  if (unverified.length > 0 && verdict === 'SAFE') {
+    verdict = 'CAUTION';
+    riskScore = Math.max(riskScore, 45);
+  }
+
   return {
     verdict,
     riskScore,
@@ -1170,7 +1516,9 @@ function runDeepHeuristicScanner(scripts) {
       : verdict === 'DANGEROUS'
       ? `⚠️ Suspicious commands found (such as downloading web scripts, disabling SELinux, or modifying crucial partition permissions).`
       : verdict === 'CAUTION'
-      ? `ℹ️ Targeted modifications found. Checked files: it does NOT wipe entire system partitions.`
+      ? (unverified.length > 0
+          ? `⚠️ Unverified encrypted binary detected. Result is not guaranteed because hidden code could not be audited.`
+          : `ℹ️ Targeted modifications found. Checked files: it does NOT wipe entire system partitions.`)
       : `✅ Clean & safe. No whole partition wipes or destructive system chmod commands detected.`,
     whatThisModuleDoes: 'Android root module or tweak script evaluated with precision partition & chmod inspection.',
     mechanisms: ['Installs scripts into root manager environment.'],
@@ -1183,6 +1531,8 @@ function runDeepHeuristicScanner(scripts) {
     uninstallSafety: 'Should remove cleanly from your root manager.',
     recommendation: verdict === 'MALICIOUS_BRICK_RISK'
       ? 'DO NOT FLASH. This contains commands capable of wiping system partitions or causing unrecoverable bootloops.'
+      : unverified.length > 0
+      ? 'CAUTION: Module contains encrypted binary that could not be decrypted. Result is not guaranteed. Only install if you trust the author.'
       : 'Module does not appear to wipe core partitions. Keep a safe-mode recovery method handy before flashing.',
     corruptingCommands: corrupting,
     riskyCommands: risky,
@@ -1190,6 +1540,8 @@ function runDeepHeuristicScanner(scripts) {
     sepolicyIssues,
     deletionLog,
     chmodLog,
+    binaryDecryption: binaryDecryption || [],
+    decryptionAssessment,
     engine: 'RootGuard Deep Heuristics (Enhanced)',
   };
 }
@@ -1201,8 +1553,8 @@ function runDeepHeuristicScanner(scripts) {
 //    - Check exact file targeted
 //    - Crucial system chmod detection
 // =======================================================================
-async function auditModuleWithRealAi(fileName, scripts, metadata, onProgress) {
-  const heuristicResult = runDeepHeuristicScanner(scripts);
+async function auditModuleWithRealAi(fileName, scripts, metadata, onProgress, binaryDecryption = []) {
+  const heuristicResult = runDeepHeuristicScanner(scripts, binaryDecryption);
   const ai = getAi();
 
   if (!ai) {
@@ -1219,7 +1571,7 @@ async function auditModuleWithRealAi(fileName, scripts, metadata, onProgress) {
     .join('\n');
 
   const prompt = `You are RootGuard AI, an expert Android security auditor specializing in Magisk, KernelSU, APatch root modules and shell scripts.
-Your job is to read all provided scripts, configuration files, and properties and evaluate what it REALLY does, with special attention to brick prevention, partition deletion vs safe cleanup, and crucial system chmod security.
+Your job is to read all provided scripts, configuration files, and properties and evaluate what it REALLY does, with special attention to brick prevention, partition deletion vs safe cleanup, crucial system chmod security, and encrypted binaries.
 
 CRITICAL DETECTION SYSTEM RULES:
 
@@ -1237,6 +1589,11 @@ CRITICAL DETECTION SYSTEM RULES:
   * SECURITY COMPROMISE: Check if chmod grants insecure global read/write (e.g. 'chmod 777', 'chmod 666') to raw partition block devices ('/dev/block/*') or root credential stores.
   * SAFE MODULE CHMOD: Standard permissions on module files (e.g. 'chmod 755 $MODDIR/service.sh', 'chmod 644 $MODDIR/system/...') are standard and safe.
 
+3. ENCRYPTED BINARY & OBFUSCATION DECRYPTION RULE:
+- Check the binary decryption findings below:
+  * If any binary payload could NOT be decrypted (marked unverified), you MUST EXPLICITLY WARN THE USER that the result is NOT guaranteed because the encrypted binary could not be decrypted. Set verdict to at least CAUTION.
+  * If a binary or script wrapper was successfully decrypted, let the user know what method decrypted it and what the extracted code or strings do.
+
 CRITICAL LANGUAGE REQUIREMENT - SIMPLE EVERYDAY ENGLISH:
 Write your entire analysis in plain, friendly, common English words that ANY smartphone user can easily understand!
 Do NOT use unexplained technical jargon.
@@ -1246,6 +1603,7 @@ Examples:
 - "wiping keystore (deletes Android's secure lock-screen PIN and fingerprint database, locking you out)"
 - "disabling SELinux (turns off Android's built-in shield that separates apps, allowing bad apps to read private files)"
 - "chmod 000 (locks down a file so even Android itself cannot run it, crashing your phone on boot)"
+- "encrypted binary (hidden code locked with a secret key that prevents security scanning)"
 
 MODULE METADATA:
 ${metaText || 'None provided'}
@@ -1253,23 +1611,27 @@ ${metaText || 'None provided'}
 MODULE SCRIPTS AUDITED:
 ${formattedScripts}
 
+BINARY DECRYPTION INSPECTION FINDINGS:
+${JSON.stringify(binaryDecryption || [], null, 2)}
+
 AUDIT SECTIONS YOU MUST WRITE BASED 100% ON YOUR READING OF THE CODE:
 1. "whatThisModuleDoes": Thorough explanation written by you detailing what this module ACTUALLY attempts to do in everyday words.
 2. "deletionAssessment": Clear explanation of what files or partitions this module deletes, and whether it's safe (e.g. harmless cache/temporary files) or dangerous (whole partition wipe).
 3. "chmodAssessment": Clear evaluation of any permission changes (chmod) on crucial system files or raw partition blocks.
-4. "mechanisms": 2 to 4 simple bullet points explaining how it hooks into Android.
-5. "scamOrPlaceboCheck": Is this module authentic or fake/snake-oil? (e.g. claiming "120FPS 8K or 10x RAM Boost").
-6. "batteryAndHeatImpact": Will this drain battery fast or cause overheating?
-7. "bootloopRisk": Is there any risk of the phone failing to turn on, especially on modern Android 12, 13, 14, or 15?
-8. "privacySafety": Does it steal private photos, passwords, IMEI, or secretly download unknown files?
-9. "uninstallSafety": When uninstalled, will it cleanly disappear or leave broken files?
-10. "corruptingCommands": Any commands that wipe whole partitions, brick devices, or strip crucial system permissions.
-11. "riskyCommands": Risky commands like downloading unverified files, disabling security, or chmod 777 on block devices.
-12. "goodCommands": Standard harmless root commands (including safe cache deletions and normal chmod 755).
-13. "verdict": One of: 'SAFE', 'CAUTION', 'DANGEROUS', 'MALICIOUS_BRICK_RISK'.
-14. "riskScore": Integer 0 to 100.
-15. "summary": A clear 2-3 sentence overview in common words.
-16. "recommendation": Direct, clear advice in everyday English.
+4. "decryptionAssessment": Clear evaluation of binary files and decryption status. If any file failed decryption, you must explicitly state that results are not guaranteed.
+5. "mechanisms": 2 to 4 simple bullet points explaining how it hooks into Android.
+6. "scamOrPlaceboCheck": Is this module authentic or fake/snake-oil? (e.g. claiming "120FPS 8K or 10x RAM Boost").
+7. "batteryAndHeatImpact": Will this drain battery fast or cause overheating?
+8. "bootloopRisk": Is there any risk of the phone failing to turn on, especially on modern Android 12, 13, 14, or 15?
+9. "privacySafety": Does it steal private photos, passwords, IMEI, or secretly download unknown files?
+10. "uninstallSafety": When uninstalled, will it cleanly disappear or leave broken files?
+11. "corruptingCommands": Any commands that wipe whole partitions, brick devices, or strip crucial system permissions.
+12. "riskyCommands": Risky commands like downloading unverified files, disabling security, or chmod 777 on block devices.
+13. "goodCommands": Standard harmless root commands (including safe cache deletions and normal chmod 755).
+14. "verdict": One of: 'SAFE', 'CAUTION', 'DANGEROUS', 'MALICIOUS_BRICK_RISK'.
+15. "riskScore": Integer 0 to 100.
+16. "summary": A clear 2-3 sentence overview in common words.
+17. "recommendation": Direct, clear advice in everyday English.
 
 Return a JSON object conforming strictly to the requested schema.`;
 
@@ -1315,6 +1677,10 @@ Return a JSON object conforming strictly to the requested schema.`;
               chmodAssessment: {
                 type: Type.STRING,
                 description: "Plain English assessment of chmod operations on crucial system files and partition blocks",
+              },
+              decryptionAssessment: {
+                type: Type.STRING,
+                description: "Plain English assessment of encrypted binary decryption. If unverified, warns that result is not guaranteed.",
               },
               mechanisms: {
                 type: Type.ARRAY,
@@ -1406,6 +1772,7 @@ Return a JSON object conforming strictly to the requested schema.`;
           whatThisModuleDoes: parsed.whatThisModuleDoes || 'Standard Android root mod.',
           deletionAssessment: parsed.deletionAssessment || 'No critical partition deletions found.',
           chmodAssessment: parsed.chmodAssessment || 'No hazardous permission modifications detected.',
+          decryptionAssessment: parsed.decryptionAssessment || heuristicResult.decryptionAssessment || '',
           mechanisms: parsed.mechanisms || [],
           scamOrPlaceboCheck: parsed.scamOrPlaceboCheck || 'No obvious fake claims detected.',
           batteryAndHeatImpact: parsed.batteryAndHeatImpact || 'Normal impact.',
@@ -1416,6 +1783,7 @@ Return a JSON object conforming strictly to the requested schema.`;
           riskyCommands: parsed.riskyCommands || [],
           goodCommands: parsed.goodCommands || [],
           recommendation: parsed.recommendation || 'Always keep a backup before flashing.',
+          binaryDecryption: binaryDecryption || [],
           engine: `Google Gemini (${modelName})`,
           modelUsed: modelName,
         };
@@ -1454,6 +1822,17 @@ Return a JSON object conforming strictly to the requested schema.`;
     if (corrupting.length > 0) {
       aiResult.verdict = 'MALICIOUS_BRICK_RISK';
       aiResult.riskScore = Math.max(aiResult.riskScore || 0, 90);
+    }
+
+    // If unverified encrypted binaries exist, safety is not guaranteed
+    const hasUnverifiedBinary = (binaryDecryption || []).some((b) => !b.decrypted);
+    if (hasUnverifiedBinary && aiResult.verdict === 'SAFE') {
+      aiResult.verdict = 'CAUTION';
+      aiResult.riskScore = Math.max(aiResult.riskScore || 0, 45);
+    }
+    aiResult.binaryDecryption = binaryDecryption || [];
+    if (!aiResult.decryptionAssessment && heuristicResult.decryptionAssessment) {
+      aiResult.decryptionAssessment = heuristicResult.decryptionAssessment;
     }
   }
 
@@ -1495,6 +1874,33 @@ function formatReportHtml(fileName, audit, quotaRemaining, isOwner, fileBreakdow
   if (audit.chmodAssessment) {
     text += `🔑 <b>System Permission &amp; chmod Analysis:</b>\n`;
     text += `${escapeHtml(audit.chmodAssessment)}\n\n`;
+  }
+
+  // 4. Decryption & Encrypted Payload Analysis
+  if (audit.binaryDecryption && audit.binaryDecryption.length > 0) {
+    const unverified = audit.binaryDecryption.filter((b) => !b.decrypted);
+    const decrypted = audit.binaryDecryption.filter((b) => b.decrypted);
+
+    if (unverified.length > 0) {
+      text += `⚠️ <b>UNVERIFIED ENCRYPTED BINARY DETECTED:</b>\n`;
+      unverified.forEach((item) => {
+        text += `• <code>${escapeHtml(item.fileName)}</code> (Entropy: ${item.entropy ? item.entropy.toFixed(2) : 'N/A'}/8.0)\n`;
+        text += `  ❗ <b>Notice: Result is NOT guaranteed.</b> Encrypted binary could not be decrypted. Because hidden code cannot be audited, exercise caution before flashing.\n`;
+      });
+      text += `\n`;
+    }
+
+    if (decrypted.length > 0) {
+      text += `🔓 <b>ENCRYPTED BINARY DECRYPTED &amp; VERIFIED:</b>\n`;
+      decrypted.forEach((item) => {
+        text += `• <code>${escapeHtml(item.fileName)}</code>: Decrypted via <b>${escapeHtml(item.method || 'De-obfuscator')}</b>\n`;
+        text += `  ✅ Decrypted payload inspected and audited for security.\n`;
+      });
+      text += `\n`;
+    }
+  } else if (audit.decryptionAssessment) {
+    text += `🔓 <b>Binary Decryption Analysis:</b>\n`;
+    text += `${escapeHtml(audit.decryptionAssessment)}\n\n`;
   }
 
   // 4. How it works (Android system hooks)
@@ -1906,14 +2312,22 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
           throw new Error('Downloaded file exceeds 25 MB size limit.');
         }
 
-        const { scripts, metadata, fileCount, allFiles, fileBreakdown } = await extractScriptsFromModule(fileName, buffer);
-        if (scripts.length === 0) {
+        const { scripts, metadata, fileCount, allFiles, fileBreakdown, binaryDecryption } = await extractScriptsFromModule(fileName, buffer);
+        if (scripts.length === 0 && (!binaryDecryption || binaryDecryption.length === 0)) {
           dbForceReleaseLock(cleanUserId);
           return await editTelegramMessage(chatId, urlStatusMsgId, `⚠️ No shell scripts or config files found inside module.`);
         }
+        if (scripts.length === 0 && binaryDecryption && binaryDecryption.length > 0) {
+          scripts.push({
+            path: binaryDecryption[0].fileName,
+            content: `# Binary file inspected: ${binaryDecryption[0].fileName}\n# Decryption status: ${binaryDecryption[0].decrypted ? 'Success' : 'Unverified'}\n# Details: ${binaryDecryption[0].details}`,
+            size: 100,
+            type: 'script',
+          });
+        }
 
         const scanId = crypto.randomUUID().slice(0, 8);
-        const finalAudit = await auditModuleWithRealAi(fileName, scripts, metadata);
+        const finalAudit = await auditModuleWithRealAi(fileName, scripts, metadata, null, binaryDecryption);
 
         dbReleaseLockAndRecordScan(cleanUserId, {
           file_name: fileName,
@@ -2150,13 +2564,22 @@ async function processModuleAuditJob(chatId, rawUserId, msg, fileName) {
       );
     }
 
-    const { scripts, metadata, fileCount, allFiles, fileBreakdown } = await extractScriptsFromModule(fileName, buffer);
+    const { scripts, metadata, fileCount, allFiles, fileBreakdown, binaryDecryption } = await extractScriptsFromModule(fileName, buffer);
 
-    if (scripts.length === 0) {
+    if (scripts.length === 0 && (!binaryDecryption || binaryDecryption.length === 0)) {
       dbForceReleaseLock(cleanUserId);
       const noScriptsText = `⚠️ No shell scripts (<code>.sh</code>) or configuration files found inside <code>${escapeHtml(fileName)}</code> (${fileCount} total files inspected).\n\n⚡ <i>made by @toshitzz</i>`;
       if (statusMsgId) return await editTelegramMessage(chatId, statusMsgId, noScriptsText);
       return await sendTelegramMessage(chatId, noScriptsText, msg.message_id);
+    }
+
+    if (scripts.length === 0 && binaryDecryption && binaryDecryption.length > 0) {
+      scripts.push({
+        path: binaryDecryption[0].fileName,
+        content: `# Binary payload inspected: ${binaryDecryption[0].fileName}\n# Decryption status: ${binaryDecryption[0].decrypted ? 'Success' : 'Unverified/Failed'}\n# Details: ${binaryDecryption[0].details}`,
+        size: 100,
+        type: 'script',
+      });
     }
 
     if (statusMsgId) {
@@ -2169,7 +2592,7 @@ async function processModuleAuditJob(chatId, rawUserId, msg, fileName) {
           5,
           65,
           '🛡️ Heuristic Code Dissection',
-          `Scanned ${scripts.length} script(s) for partition wipes, crucial chmod & bootloop hazards...`
+          `Scanned ${scripts.length} script(s) & binary payload(s) for partition wipes, chmod & decryption...`
         )
       );
     }
@@ -2193,7 +2616,7 @@ async function processModuleAuditJob(chatId, rawUserId, msg, fileName) {
       }
     };
 
-    const audit = await auditModuleWithRealAi(fileName, scripts, metadata, progressCallback);
+    const audit = await auditModuleWithRealAi(fileName, scripts, metadata, progressCallback, binaryDecryption);
 
     if (statusMsgId) {
       await editTelegramMessage(
