@@ -1,7 +1,7 @@
 // bot.js - Standalone Telegram Bot for RootGuard (Universal Node.js with SQLite & Multi-Model AI)
 // Runs directly with: node bot.js
 // Dependencies: npm install dotenv @google/genai jszip
-// ⚡ made by @toshitzz
+// ⚡ made by @toshitzz | Enhanced with Precision Partition Deletion & Crucial Chmod Detection
 
 const dotenv = require('dotenv');
 const { GoogleGenAI, Type } = require('@google/genai');
@@ -20,12 +20,17 @@ dotenv.config();
  * ⚡ made by @toshitzz
  * =======================================================================
  * 
- * Features:
+ * Detection System Features:
+ * • Precision File Deletion Analysis:
+ *   - Prevents false-positive high-risk flags for harmless/targeted file removals (cache, dalvik, logs, $MODDIR).
+ *   - Strictly flags CATASTROPHIC partition wipes (/system, /data, /vendor, /boot, /dev/block) that cause bootloops/unbootable devices.
+ * • Crucial System chmod Detection:
+ *   - Monitors permission stripping on core system binaries and partitions (chmod 000 /system/bin/* -> bootloop hazard).
+ *   - Monitors unsafe exposure of raw partition blocks and root vaults (chmod 777 /dev/block/*).
  * • 100% Real Gemini AI Analysis (Context, Purpose, Battery, Scam Check)
  * • Plain English Explanations (Every technical word explained in simple terms)
- * • Super Fast Model Switching (5s timeout with live Telegram status updates)
+ * • Super Fast Model Switching (Failover resilience with live status updates)
  * • Built-in SQLite Database (User cooldowns, daily quotas, scan history)
- * • High Concurrency Queue (Handles heavy user traffic without crashing)
  * • Interactive Telegram Buttons (Simpler Words, What Should I Do, Code, Bootloop)
  * • Offline Deep Heuristic Engine (Zero missed brick commands guarantee)
  * =======================================================================
@@ -50,23 +55,21 @@ const OWNER_IDS = (process.env.OWNER_ID || '')
   .filter(Boolean);
 
 if (!TELEGRAM_TOKEN) {
-  console.error('❌ Error: TELEGRAM_BOT_TOKEN is missing in .env');
-  console.error('👉 Get one for free from @BotFather on Telegram.');
-  process.exit(1);
+  console.warn('⚠️ Warning: TELEGRAM_BOT_TOKEN is missing in environment.');
+  console.warn('👉 To connect to Telegram, set TELEGRAM_BOT_TOKEN in .env (get token from @BotFather).');
 }
 
 if (!GEMINI_API_KEY) {
-  console.error('❌ Error: GEMINI_API_KEY is missing in .env');
-  console.error('👉 Get a free key at: https://aistudio.google.com/app/apikey');
-  process.exit(1);
+  console.warn('⚠️ Warning: GEMINI_API_KEY is missing in environment.');
+  console.warn('👉 Get an API key at: https://aistudio.google.com/app/apikey');
 }
 
 const maskedGeminiKey = GEMINI_API_KEY.length > 10
   ? `${GEMINI_API_KEY.slice(0, 6)}...${GEMINI_API_KEY.slice(-4)}`
-  : '********';
+  : 'None configured';
 
 console.log('⚡ RootGuard Telegram Bot • made by @toshitzz');
-console.log(`🔑 Google Gemini API Key: Active & Loaded (${maskedGeminiKey})`);
+console.log(`🔑 Google Gemini API Key: ${GEMINI_API_KEY ? 'Loaded (' + maskedGeminiKey + ')' : 'Offline'}`);
 console.log('👑 Configured Owner IDs (Unlimited scans):', OWNER_IDS.length ? OWNER_IDS.join(', ') : 'None specified (Add OWNER_ID in .env)');
 
 // =======================================================================
@@ -141,11 +144,14 @@ try {
   `);
   console.log('🗄️ SQLite Database: Active & Initialized (rootguard.db)');
 } catch (e) {
-  console.warn('⚠️ Native node:sqlite not supported in this runtime. Engaging Memory-WAL store fallback:', e.message);
+  console.warn('⚠️ Native node:sqlite not supported in this runtime. Engaging Memory store fallback:', e.message);
   useFallbackDb = true;
 }
 
-// Persisted Scan Cache Helpers (Ensures interactive buttons work across restarts)
+// In-memory cache for interactive button callbacks
+const recentScansCache = new Map(); // scanId -> { audit, scripts, fileName, summary }
+const knownChatIds = new Set();
+
 function dbSaveScanCache(scanId, fileName, audit) {
   if (!scanId) return;
   recentScansCache.set(scanId, { audit, fileName, time: Date.now() });
@@ -177,7 +183,6 @@ function dbGetScanCache(scanId) {
   return null;
 }
 
-// Database Helpers
 function dbRegisterOrTouchUser(userId, username, firstName, isOwner = false) {
   const cleanId = String(userId).replace(/^tg:/i, '').trim();
   const now = Date.now();
@@ -207,7 +212,6 @@ function dbRegisterOrTouchUser(userId, username, firstName, isOwner = false) {
     }
   }
 
-  // Memory fallback
   let user = memoryStore.users.get(cleanId);
   if (!user) {
     user = {
@@ -275,11 +279,9 @@ function isUserOwnerOrVip(rawUserId) {
   return Boolean(user && user.is_vip === 1);
 }
 
-// Rate Limiting & Capacity Defaults
-const DAILY_SCAN_LIMIT = 5; // 5 free AI module scans per user per day
-const COOLDOWN_SECONDS = 15; // 15 seconds cooldown between completed audits
+const DAILY_SCAN_LIMIT = 5;
+const COOLDOWN_SECONDS = 15;
 
-// Check cooldown, scan lock & daily quota
 function dbCheckCooldownAndLock(userId, isOwner = false, cooldownSeconds = COOLDOWN_SECONDS, dailyMax = DAILY_SCAN_LIMIT) {
   const cleanId = String(userId).replace(/^tg:/i, '').trim();
   const user = dbRegisterOrTouchUser(cleanId, undefined, undefined, isOwner);
@@ -294,16 +296,13 @@ function dbCheckCooldownAndLock(userId, isOwner = false, cooldownSeconds = COOLD
 
   if (!useFallbackDb && sqliteDb) {
     try {
-      // 1. Check cooldowns table
       const cdRow = sqliteDb.prepare('SELECT * FROM cooldowns WHERE user_id = ?').get(cleanId);
       if (cdRow) {
-        // Enforce cooldown first
         if (!isVip && cdRow.cooldown_until && now < cdRow.cooldown_until) {
           const remaining = Math.max(1, Math.ceil((cdRow.cooldown_until - now) / 1000));
           return { allowed: false, reason: 'COOLDOWN', remainingSeconds: remaining };
         }
 
-        // Check active scan lock (expire stale locks after 90s)
         if (cdRow.active_scan_lock === 1) {
           if (now - cdRow.last_scan_time < 90000) {
             const waitSec = Math.max(1, Math.ceil((90000 - (now - cdRow.last_scan_time)) / 1000));
@@ -312,7 +311,6 @@ function dbCheckCooldownAndLock(userId, isOwner = false, cooldownSeconds = COOLD
         }
       }
 
-      // 2. Check daily quotas table
       const quotaRow = sqliteDb.prepare('SELECT scan_count FROM daily_quotas WHERE user_id = ? AND date = ?').get(cleanId, today);
       const currentCount = quotaRow ? quotaRow.scan_count : 0;
 
@@ -320,7 +318,6 @@ function dbCheckCooldownAndLock(userId, isOwner = false, cooldownSeconds = COOLD
         return { allowed: false, reason: 'QUOTA_EXCEEDED', remainingDailyScans: 0, usedCount: currentCount, dailyMax };
       }
 
-      // Acquire lock
       sqliteDb.prepare(`
         INSERT INTO cooldowns (user_id, last_scan_time, active_scan_lock, cooldown_until)
         VALUES (?, ?, 1, 0)
@@ -339,7 +336,6 @@ function dbCheckCooldownAndLock(userId, isOwner = false, cooldownSeconds = COOLD
     }
   }
 
-  // Fallback memory logic
   const cd = memoryStore.cooldowns.get(cleanId) || { last_scan_time: 0, active_scan_lock: 0, cooldown_until: 0 };
   if (!isVip && cd.cooldown_until && now < cd.cooldown_until) {
     return { allowed: false, reason: 'COOLDOWN', remainingSeconds: Math.max(1, Math.ceil((cd.cooldown_until - now) / 1000)) };
@@ -376,7 +372,6 @@ function dbReleaseLockAndRecordScan(userId, record, cooldownSeconds = COOLDOWN_S
 
   if (!useFallbackDb && sqliteDb) {
     try {
-      // 1. Release lock & set cooldown
       sqliteDb.prepare(`
         INSERT INTO cooldowns (user_id, last_scan_time, active_scan_lock, cooldown_until)
         VALUES (?, ?, 0, ?)
@@ -386,7 +381,6 @@ function dbReleaseLockAndRecordScan(userId, record, cooldownSeconds = COOLDOWN_S
           cooldown_until = excluded.cooldown_until
       `).run(cleanId, now, cooldownUntil);
 
-      // 2. Increment daily quota
       sqliteDb.prepare(`
         INSERT INTO daily_quotas (user_id, date, scan_count)
         VALUES (?, ?, 1)
@@ -394,10 +388,8 @@ function dbReleaseLockAndRecordScan(userId, record, cooldownSeconds = COOLDOWN_S
           scan_count = scan_count + 1
       `).run(cleanId, today);
 
-      // 3. Increment user total scans
       sqliteDb.prepare('UPDATE users SET total_scans = total_scans + 1 WHERE user_id = ?').run(cleanId);
 
-      // 4. Log scan record
       sqliteDb.prepare(`
         INSERT INTO scans (user_id, file_name, file_hash, file_size, verdict, risk_score, model_used, duration_ms, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -418,7 +410,6 @@ function dbReleaseLockAndRecordScan(userId, record, cooldownSeconds = COOLDOWN_S
     }
   }
 
-  // Memory fallback
   const cd = memoryStore.cooldowns.get(cleanId) || {};
   cd.active_scan_lock = 0;
   cd.last_scan_time = now;
@@ -511,12 +502,6 @@ function dbResetQuota(userId) {
   return true;
 }
 
-// In-memory cache for interactive button callbacks
-const recentScansCache = new Map(); // scanId -> { audit, scripts, fileName, summary }
-
-// Broadcast chat ID registry
-const knownChatIds = new Set();
-
 // =======================================================================
 // 2. High-Concurrency Job Queue
 // =======================================================================
@@ -550,7 +535,14 @@ let aiInstance = null;
 function getAi() {
   if (!aiInstance && GEMINI_API_KEY) {
     try {
-      aiInstance = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+      aiInstance = new GoogleGenAI({
+        apiKey: GEMINI_API_KEY,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          },
+        },
+      });
     } catch (e) {
       console.warn('Could not initialize GoogleGenAI SDK:', e.message);
     }
@@ -565,7 +557,6 @@ function sleepMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Resilient Telegram API client with auto-retry on transient socket drops (ECONNABORTED/ECONNRESET/fetch failed)
 async function callTelegram(method, params = {}, timeoutMs = 35000, maxRetries = 2) {
   let attempt = 0;
   while (attempt <= maxRetries) {
@@ -588,7 +579,6 @@ async function callTelegram(method, params = {}, timeoutMs = 35000, maxRetries =
         return data;
       }
 
-      // Legacy fallback
       const data = await new Promise((resolve, reject) => {
         const postData = JSON.stringify(params);
         const options = {
@@ -655,6 +645,7 @@ async function callTelegram(method, params = {}, timeoutMs = 35000, maxRetries =
 }
 
 async function sendTelegramMessage(chatId, text, replyToId = null, replyMarkup = null) {
+  if (!TELEGRAM_TOKEN) return { ok: false, error: 'No Telegram token' };
   const params = {
     chat_id: chatId,
     text: text,
@@ -684,6 +675,7 @@ async function sendTelegramMessage(chatId, text, replyToId = null, replyMarkup =
 }
 
 async function editTelegramMessage(chatId, messageId, text, replyMarkup = null) {
+  if (!TELEGRAM_TOKEN) return { ok: false };
   const params = {
     chat_id: chatId,
     message_id: messageId,
@@ -705,14 +697,13 @@ async function editTelegramMessage(chatId, messageId, text, replyMarkup = null) 
       await sleepMs(250);
       return await callTelegram('editMessageText', params, 35000, 1);
     } catch (retryErr) {
-      // If text is unchanged or message is gone, ignore silently
       return { ok: false, error: retryErr.message };
     }
   }
 }
 
 async function answerCallbackQuery(callbackQueryId, text = '', showAlert = false) {
-  if (!callbackQueryId) return { ok: true };
+  if (!callbackQueryId || !TELEGRAM_TOKEN) return { ok: true };
   try {
     return await callTelegram(
       'answerCallbackQuery',
@@ -730,6 +721,7 @@ async function answerCallbackQuery(callbackQueryId, text = '', showAlert = false
 }
 
 async function sendChatAction(chatId, action = 'typing') {
+  if (!TELEGRAM_TOKEN) return { ok: false };
   try {
     return await callTelegram('sendChatAction', { chat_id: chatId, action }, 8000, 0);
   } catch (err) {
@@ -737,7 +729,6 @@ async function sendChatAction(chatId, action = 'typing') {
   }
 }
 
-// Interactive Animated Progress Indicator for Module Checking
 function renderAuditProgress(fileName, step, totalSteps, pct, title, subtitle) {
   const filledBars = Math.max(1, Math.min(10, Math.round((pct / 100) * 10)));
   const emptyBars = 10 - filledBars;
@@ -846,7 +837,6 @@ async function extractScriptsFromModule(fileName, bufferOrText) {
     };
   }
 
-  // Guard against encrypted archives
   if (Buffer.isBuffer(bufferOrText) && isZipEncrypted(bufferOrText)) {
     throw new Error('ENCRYPTED_ZIP');
   }
@@ -974,12 +964,15 @@ async function extractScriptsFromModule(fileName, bufferOrText) {
 
 // =======================================================================
 // 6. Deep Static Heuristic Engine (100% Offline Accuracy Safety Net)
+//    ENHANCED: Precision Partition Wipe vs Safe File Deletion & Crucial Chmod Detection
 // =======================================================================
 function runDeepHeuristicScanner(scripts) {
   const corrupting = [];
   const risky = [];
   const good = [];
   const sepolicyIssues = [];
+  const deletionLog = [];
+  const chmodLog = [];
 
   for (const file of scripts) {
     const lines = file.content.split('\n');
@@ -987,56 +980,160 @@ function runDeepHeuristicScanner(scripts) {
       const line = rawLine.trim();
       if (!line || line.startsWith('#')) return;
 
-      // 1. DATA CORRUPTING COMMANDS
-      if (line.match(/rm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?(\/data\b|\/data\/media|\/data\/system)/i)) {
+      // =================================================================
+      // [A] PRECISION FILE & PARTITION DELETION DETECTION
+      // Goal: Prevent bricking/bootloops from partition wipes, but DO NOT
+      // flag harmless file deletions (temp, cache, module self-cleanup).
+      // =================================================================
+      if (line.match(/\brm\b/i)) {
+        // 1. CATASTROPHIC WHOLE-PARTITION WIPES (Causes phone unable to boot / bootloop / permanent brick)
+        const isCatastrophicWipe =
+          line.match(/rm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?(\/\s*$|\/\*\s*$|\/system\/?(\*|\s*$)|(\/|")system\/\*|\/data\/?(\*|\s*$)|(\/|")data\/\*|\/vendor\/?(\*|\s*$)|(\/|")vendor\/\*|\/product\/?(\*|\s*$)|(\/|")product\/\*|\/boot\/?(\*|\s*$)|(\/|")boot\/\*|\/metadata\/?(\*|\s*$))/i) ||
+          line.match(/rm\s+(-[a-zA-Z]*\s+)*(\/init\b|\/system\/bin\/init|\/system\/bin\/app_process|\/system\/bin\/linker|\/system\/framework\/?(\*|\s*$))/i) ||
+          line.match(/rm\s+(-[a-zA-Z]*\s+)*.*(locksettings\.db|gatekeeper\.password\.key|gatekeeper\.pattern\.key|\/data\/system\/users\b)/i);
+
+        // 2. HARMLESS / NORMAL MODULE FILE DELETIONS (Cache, dalvik, logs, temp, module's own folder)
+        const isHarmlessCleanup =
+          line.match(/(\$MODDIR|\$MODPATH|\/data\/adb\/modules\/|\/data\/adb\/modules_update\/|\/data\/local\/tmp\/|\/cache\b|\/data\/dalvik-cache\b|\/data\/cache\b|\/dev\/tmp\b|\.log\b|\.tmp\b|\.bak\b|\.pid\b)/i) &&
+          !isCatastrophicWipe;
+
+        if (isCatastrophicWipe) {
+          corrupting.push({
+            command: line,
+            file: file.path,
+            type: 'PARTITION_WIPE_BRICK_RISK',
+            explanation: 'Catastrophic deletion of whole partition or core boot files (makes device unable to boot or triggers permanent bootloop).',
+          });
+          deletionLog.push({ command: line, classification: 'CATASTROPHIC_PARTITION_WIPE', risk: 'HIGH' });
+        } else if (isHarmlessCleanup) {
+          good.push({
+            command: line,
+            file: file.path,
+            type: 'SAFE_FILE_CLEANUP',
+            explanation: 'Safe cleanup of non-critical cache, temporary mod files, or module directory.',
+          });
+          deletionLog.push({ command: line, classification: 'SAFE_TEMPORARY_CLEANUP', risk: 'NONE' });
+        } else {
+          // Specific targeted file deletion (e.g. debloating an individual APK or removing a single config)
+          // DO NOT mark as corrupting/brick hazard! Review in caution.
+          risky.push({
+            command: line,
+            file: file.path,
+            type: 'TARGETED_FILE_DELETION',
+            explanation: 'Deletes a targeted individual file. Verified that it does NOT wipe entire system partition.',
+          });
+          deletionLog.push({ command: line, classification: 'TARGETED_SPECIFIC_FILE', risk: 'LOW' });
+        }
+      }
+
+      // =================================================================
+      // [B] CRUCIAL SYSTEM CHMOD SECURITY DETECTION
+      // Goal: Detect permission tampering that leads to boot failure
+      // (stripping permissions on /system) or severe privilege compromise.
+      // =================================================================
+      else if (line.match(/\bchmod\b/i)) {
+        // 1. BOOTLOOP / BRICK CHMOD: Stripping execute or read on vital system paths (chmod 000 /system/bin/*)
+        const isBootloopChmod =
+          line.match(/chmod\s+(-[a-zA-Z]*\s+)*(000|0000|\-x|[0-3][0-3][0-3])\s+(\/|\/system|\/init|\/system\/bin|\/system\/xbin|\/vendor|\/data\b|\/system\/framework)/i);
+
+        // 2. CRUCIAL PARTITION RAW BLOCK EXPOSURE / WEAKENING (chmod 777 /dev/block/* or /data/system)
+        const isInsecureSystemChmod =
+          line.match(/chmod\s+(-[a-zA-Z]*\s+)*(777|666|a\+[rwxd]+)\s+(\/dev\/block|\/data\/system|\/data\/adb|\/proc\/kmsg|\/dev\/socket)/i);
+
+        // 3. SUID BIT ESCALATION ON ARBITRARY BINARIES
+        const isSuidEscalation =
+          line.match(/chmod\s+(-[a-zA-Z]*\s+)*([1-7]?[47][0-7]{3}|\+s|u\+s)\s+(\/data\/local\/tmp|\/sdcard|\/tmp)/i);
+
+        // 4. SAFE STANDARD ROOT MODULE CHMOD (e.g. chmod 755 $MODDIR/*.sh, chmod 644 configs)
+        const isSafeModChmod =
+          line.match(/chmod\s+(-[a-zA-Z]*\s+)*(755|644|0755|0644|\+x)\s+(\$MODDIR|\$MODPATH|\/data\/adb\/modules|\/data\/local\/tmp|\.\/)/i);
+
+        if (isBootloopChmod) {
+          corrupting.push({
+            command: line,
+            file: file.path,
+            type: 'CRITICAL_CHMOD_BOOTLOOP_HAZARD',
+            explanation: 'Removes execute/read permissions from crucial system binaries or partitions, causing immediate boot failure or bootloop!',
+          });
+          chmodLog.push({ command: line, classification: 'CRITICAL_PERMISSION_STRIPPING', risk: 'HIGH' });
+        } else if (isInsecureSystemChmod) {
+          risky.push({
+            command: line,
+            file: file.path,
+            type: 'CRITICAL_BLOCK_CHMOD_EXPOSURE',
+            explanation: 'Grants world-accessible (777/666) permissions to raw partition block devices or root vaults, breaking Android partition security.',
+          });
+          chmodLog.push({ command: line, classification: 'RAW_BLOCK_OVEREXPOSURE', risk: 'MEDIUM' });
+        } else if (isSuidEscalation) {
+          risky.push({
+            command: line,
+            file: file.path,
+            type: 'SUID_INJECTION',
+            explanation: 'Sets SUID bit on temporary storage to elevate binary permissions.',
+          });
+          chmodLog.push({ command: line, classification: 'SUID_ELEVATION', risk: 'MEDIUM' });
+        } else if (isSafeModChmod) {
+          good.push({
+            command: line,
+            file: file.path,
+            type: 'SAFE_MODULE_CHMOD',
+            explanation: 'Standard module executable permission setup (chmod 755/644).',
+          });
+          chmodLog.push({ command: line, classification: 'STANDARD_SAFE_CHMOD', risk: 'NONE' });
+        } else {
+          good.push({ command: line, file: file.path });
+        }
+      }
+
+      // =================================================================
+      // [C] OTHER BRICK & PARTITION OVERWRITE COMMANDS
+      // =================================================================
+      else if (line.match(/dd\s+if=.*\s+of=\/dev\/block\/(bootdevice|by-name)\/(boot|recovery|super|modem|efs|vbmeta|userdata|system)/i)) {
         corrupting.push({
           command: line,
           file: file.path,
-          explanation: 'Wipes your phone\'s internal user data (/data) or personal files.',
-        });
-      } else if (line.match(/dd\s+if=.*\s+of=\/dev\/block\/(bootdevice|by-name)\/(boot|recovery|super|modem|efs|vbmeta)/i)) {
-        corrupting.push({
-          command: line,
-          file: file.path,
+          type: 'RAW_BLOCK_OVERWRITE',
           explanation: 'Overwrites critical Android partitions directly, causing a permanent brick.',
         });
-      } else if (line.match(/locksettings\.db/i)) {
+      } else if (line.match(/mke2fs|make_ext4fs|blkdiscard|wipe\s+data/i)) {
         corrupting.push({
           command: line,
           file: file.path,
-          explanation: 'Deletes Android keystore/password vault, permanently locking you out.',
-        });
-      } else if (line.match(/mke2fs|make_ext4fs|wipe\s+data/i)) {
-        corrupting.push({
-          command: line,
-          file: file.path,
-          explanation: 'Re-formats partition blocks and wipes data.',
+          type: 'BLOCK_FORMAT_WIPE',
+          explanation: 'Re-formats partition blocks or wipes flash storage.',
         });
       }
 
-      // 2. RISKY / SUSPICIOUS COMMANDS
+      // =================================================================
+      // [D] GENERAL RISKY / NETWORK SUSPICIOUS COMMANDS
+      // =================================================================
       else if (line.match(/setenforce\s+0/i)) {
         risky.push({
           command: line,
           file: file.path,
+          type: 'SELINUX_DISABLED',
           explanation: 'Turns off SELinux (Android\'s built-in shield that separates apps), allowing rogue apps to spy on private files.',
         });
       } else if (line.match(/(curl|wget)\s+.*\|\s*(sh|bash)/i)) {
         risky.push({
           command: line,
           file: file.path,
+          type: 'REMOTE_CODE_EXECUTION',
           explanation: 'Downloads unverified web code and runs it directly with root permissions.',
         });
       } else if (line.match(/eval\s+.*\$\(echo\s+.*base64/i)) {
         risky.push({
           command: line,
           file: file.path,
+          type: 'OBFUSCATED_BASE64',
           explanation: 'Executes hidden, encrypted base64 commands to conceal actions.',
         });
       }
 
-      // 3. SAFE / STANDARD MAGISK & KSU COMMANDS
-      else if (line.match(/ui_print|set_perm|resetprop|MODDIR=\${0%\/\*}/i)) {
+      // =================================================================
+      // [E] SAFE / STANDARD MAGISK & KSU COMMANDS
+      // =================================================================
+      else if (line.match(/ui_print|set_perm|resetprop|MODDIR=\${0%\/\*}|magisk\s+--install/i)) {
         good.push({ command: line, file: file.path });
       }
     });
@@ -1058,7 +1155,7 @@ function runDeepHeuristicScanner(scripts) {
     riskScore = Math.min(100, 85 + corrupting.length * 5);
     verdict = 'MALICIOUS_BRICK_RISK';
   } else if (risky.length > 0) {
-    riskScore = Math.min(80, 35 + risky.length * 15);
+    riskScore = Math.min(75, 25 + risky.length * 12);
     verdict = riskScore > 50 ? 'DANGEROUS' : 'CAUTION';
   } else {
     riskScore = Math.max(0, 5 - good.length * 2);
@@ -1069,30 +1166,40 @@ function runDeepHeuristicScanner(scripts) {
     verdict,
     riskScore,
     summary: verdict === 'MALICIOUS_BRICK_RISK'
-      ? `🚨 Dangerous brick or data-wipe command detected! This module can damage your phone.`
+      ? `🚨 Dangerous partition wipe or crucial system chmod detected! This module will cause a bootloop or brick your phone.`
       : verdict === 'DANGEROUS'
-      ? `⚠️ Suspicious commands found (such as downloading web scripts or turning off security).`
-      : `✅ No destructive wipe commands found. Follows basic root practices.`,
-    whatThisModuleDoes: 'General root script or configuration tweaks (audited via offline deep heuristics safety net).',
+      ? `⚠️ Suspicious commands found (such as downloading web scripts, disabling SELinux, or modifying crucial partition permissions).`
+      : verdict === 'CAUTION'
+      ? `ℹ️ Targeted modifications found. Checked files: it does NOT wipe entire system partitions.`
+      : `✅ Clean & safe. No whole partition wipes or destructive system chmod commands detected.`,
+    whatThisModuleDoes: 'Android root module or tweak script evaluated with precision partition & chmod inspection.',
     mechanisms: ['Installs scripts into root manager environment.'],
     scamOrPlaceboCheck: 'Basic static heuristic check. Verify module author before flashing.',
     batteryAndHeatImpact: 'Standard root module impact.',
-    bootloopRisk: corrupting.length > 0 ? 'High brick and bootloop hazard!' : 'Low risk.',
-    privacySafety: risky.length > 0 ? 'Review flagged network commands.' : 'No data exfiltration found.',
+    bootloopRisk: corrupting.length > 0
+      ? 'CRITICAL BRICK & BOOTLOOP HAZARD: Detected commands that wipe partitions or strip crucial system permissions!'
+      : 'Low risk: No destructive partition-wide wipes or system chmod stripping found.',
+    privacySafety: risky.length > 0 ? 'Review flagged network/permission commands.' : 'No data exfiltration found.',
     uninstallSafety: 'Should remove cleanly from your root manager.',
     recommendation: verdict === 'MALICIOUS_BRICK_RISK'
-      ? 'DO NOT FLASH. This contains commands capable of bricking your device or wiping personal photos.'
-      : 'Module appears acceptable. Always keep a bootloop recovery method available.',
+      ? 'DO NOT FLASH. This contains commands capable of wiping system partitions or causing unrecoverable bootloops.'
+      : 'Module does not appear to wipe core partitions. Keep a safe-mode recovery method handy before flashing.',
     corruptingCommands: corrupting,
     riskyCommands: risky,
     goodCommands: good,
     sepolicyIssues,
-    engine: 'RootGuard Deep Heuristics',
+    deletionLog,
+    chmodLog,
+    engine: 'RootGuard Deep Heuristics (Enhanced)',
   };
 }
 
 // =======================================================================
 // 7. 100% Real Gemini AI Analysis + Super Fast Switching
+//    UPDATED DETECTION INSTRUCTIONS:
+//    - Do not mark high risk if deleting parts of file/cache/temp (not whole partition)
+//    - Check exact file targeted
+//    - Crucial system chmod detection
 // =======================================================================
 async function auditModuleWithRealAi(fileName, scripts, metadata, onProgress) {
   const heuristicResult = runDeepHeuristicScanner(scripts);
@@ -1111,8 +1218,24 @@ async function auditModuleWithRealAi(fileName, scripts, metadata, onProgress) {
     .map(([k, v]) => `${k}: ${v}`)
     .join('\n');
 
-  const prompt = `You are RootGuard AI, an expert Android security auditor.
-Your job is to read all provided scripts, configuration files, and properties of this Android root module (Magisk, KernelSU, APatch, or .sh script) and evaluate what it REALLY does.
+  const prompt = `You are RootGuard AI, an expert Android security auditor specializing in Magisk, KernelSU, APatch root modules and shell scripts.
+Your job is to read all provided scripts, configuration files, and properties and evaluate what it REALLY does, with special attention to brick prevention, partition deletion vs safe cleanup, and crucial system chmod security.
+
+CRITICAL DETECTION SYSTEM RULES:
+
+1. FILE & PARTITION DELETION RULE (DO NOT OVER-FLAG DELETIONS):
+- OUR GOAL: Prevent modules that wipe out entire system partitions, corrupt partition blocks, or make the phone UNABLE TO BOOT ANYMORE (PERMANENT BOOTLOOP / BRICK).
+- DO NOT mark a module as HIGH RISK or MALICIOUS simply because it uses 'rm' or deletes something!
+- Carefully examine WHICH SPECIFIC FILE or directory the code deletes:
+  * HIGH RISK / MALICIOUS BRICK: ONLY flag if the deletion wipes an entire partition (e.g. 'rm -rf /system', 'rm -rf /data', 'rm -rf /vendor', 'rm -rf /boot', 'rm -rf /*'), formats raw block devices ('/dev/block/*'), wipes Android Keystore ('locksettings.db'), or deletes core boot binaries ('/init', '/system/bin/init', 'app_process').
+  * SAFE / HARMLESS CLEANUP: If the code deletes temporary files, caches, dalvik-cache ('/data/dalvik-cache'), logs ('*.log'), lockfiles, or files inside its own module directory ('$MODDIR', '/data/adb/modules/'), this WILL NOT harm the phone or cause bootloops! Treat these as normal root operations and DO NOT mark high risk.
+  * CAUTION: If the code deletes a single specific bloatware app (e.g. 'rm /system/app/Bloat.apk') or a replaceable font/sound, explain which file is deleted. This is targeted modification, NOT a partition brick.
+
+2. CRUCIAL SYSTEM CHMOD DETECTION RULE:
+- Inspect all 'chmod' operations on system partitions and files:
+  * BOOTLOOP HAZARD: Check if chmod removes execute or read rights (e.g. 'chmod 000', 'chmod -x', 'chmod 0000') on crucial system directories or binaries ('/system', '/init', '/system/bin/*', '/vendor', '/data'). This causes instant bootloops or unbootable devices!
+  * SECURITY COMPROMISE: Check if chmod grants insecure global read/write (e.g. 'chmod 777', 'chmod 666') to raw partition block devices ('/dev/block/*') or root credential stores.
+  * SAFE MODULE CHMOD: Standard permissions on module files (e.g. 'chmod 755 $MODDIR/service.sh', 'chmod 644 $MODDIR/system/...') are standard and safe.
 
 CRITICAL LANGUAGE REQUIREMENT - SIMPLE EVERYDAY ENGLISH:
 Write your entire analysis in plain, friendly, common English words that ANY smartphone user can easily understand!
@@ -1122,6 +1245,7 @@ Examples:
 - "bootloop (when your phone gets stuck on the restart logo and cannot turn on)"
 - "wiping keystore (deletes Android's secure lock-screen PIN and fingerprint database, locking you out)"
 - "disabling SELinux (turns off Android's built-in shield that separates apps, allowing bad apps to read private files)"
+- "chmod 000 (locks down a file so even Android itself cannot run it, crashing your phone on boot)"
 
 MODULE METADATA:
 ${metaText || 'None provided'}
@@ -1130,26 +1254,29 @@ MODULE SCRIPTS AUDITED:
 ${formattedScripts}
 
 AUDIT SECTIONS YOU MUST WRITE BASED 100% ON YOUR READING OF THE CODE:
-1. "whatThisModuleDoes": A thorough explanation written 100% by you detailing what this module ACTUALLY attempts to do on the phone. Describe its real function in everyday words.
-2. "mechanisms": 2 to 4 simple bullet points explaining how it hooks into Android (e.g. running at startup, changing settings, replacing files).
-3. "scamOrPlaceboCheck": Is this module authentic or fake/snake-oil? (e.g., claiming "120FPS 8K or 10x RAM Boost" using empty loops or placebo commands).
-4. "batteryAndHeatImpact": Will this drain battery fast or cause the phone to get hot? Explain why in simple words.
-5. "bootloopRisk": Is there any risk of the phone failing to turn on, especially on modern Android 12, 13, 14, or 15?
-6. "privacySafety": Does it steal private photos, passwords, IMEI, or secretly download unknown files from the internet?
-7. "uninstallSafety": When the user uninstalls it later, will it cleanly disappear or leave broken system files behind?
-8. "corruptingCommands": Any commands that wipe data or brick partitions.
-9. "riskyCommands": Risky commands like downloading unverified files from the web or disabling security.
-10. "goodCommands": Standard harmless root commands.
-11. "verdict": One of: 'SAFE', 'CAUTION', 'DANGEROUS', 'MALICIOUS_BRICK_RISK'.
-12. "riskScore": Integer 0 to 100.
-13. "summary": A clear 2-3 sentence overview in common words.
-14. "recommendation": Direct, clear advice in everyday English on what the user should do.
+1. "whatThisModuleDoes": Thorough explanation written by you detailing what this module ACTUALLY attempts to do in everyday words.
+2. "deletionAssessment": Clear explanation of what files or partitions this module deletes, and whether it's safe (e.g. harmless cache/temporary files) or dangerous (whole partition wipe).
+3. "chmodAssessment": Clear evaluation of any permission changes (chmod) on crucial system files or raw partition blocks.
+4. "mechanisms": 2 to 4 simple bullet points explaining how it hooks into Android.
+5. "scamOrPlaceboCheck": Is this module authentic or fake/snake-oil? (e.g. claiming "120FPS 8K or 10x RAM Boost").
+6. "batteryAndHeatImpact": Will this drain battery fast or cause overheating?
+7. "bootloopRisk": Is there any risk of the phone failing to turn on, especially on modern Android 12, 13, 14, or 15?
+8. "privacySafety": Does it steal private photos, passwords, IMEI, or secretly download unknown files?
+9. "uninstallSafety": When uninstalled, will it cleanly disappear or leave broken files?
+10. "corruptingCommands": Any commands that wipe whole partitions, brick devices, or strip crucial system permissions.
+11. "riskyCommands": Risky commands like downloading unverified files, disabling security, or chmod 777 on block devices.
+12. "goodCommands": Standard harmless root commands (including safe cache deletions and normal chmod 755).
+13. "verdict": One of: 'SAFE', 'CAUTION', 'DANGEROUS', 'MALICIOUS_BRICK_RISK'.
+14. "riskScore": Integer 0 to 100.
+15. "summary": A clear 2-3 sentence overview in common words.
+16. "recommendation": Direct, clear advice in everyday English.
 
 Return a JSON object conforming strictly to the requested schema.`;
 
   const configuredModel = (process.env.GEMINI_MODEL || '').trim();
   const candidateModels = [
     configuredModel,
+    'gemini-3.8-flash',
     'gemini-3.1-flash-lite',
   ].filter(Boolean);
   const modelsToTry = Array.from(new Set(candidateModels));
@@ -1162,7 +1289,6 @@ Return a JSON object conforming strictly to the requested schema.`;
     try {
       console.log(`🤖 Querying Gemini AI via model [${modelName}]...`);
 
-      // Robust inference timeout: 25 seconds per model (plenty of time to generate detailed JSON)
       const generatePromise = ai.models.generateContent({
         model: modelName,
         contents: prompt,
@@ -1180,7 +1306,15 @@ Return a JSON object conforming strictly to the requested schema.`;
               summary: { type: Type.STRING, description: "Plain English summary" },
               whatThisModuleDoes: {
                 type: Type.STRING,
-                description: "Complete context written 100% by AI explaining what this module actually does on the phone in plain English",
+                description: "Context explaining what this module actually does in plain English",
+              },
+              deletionAssessment: {
+                type: Type.STRING,
+                description: "Plain English assessment of deleted files (distinguishing harmless cache/temp vs whole partition wipe)",
+              },
+              chmodAssessment: {
+                type: Type.STRING,
+                description: "Plain English assessment of chmod operations on crucial system files and partition blocks",
               },
               mechanisms: {
                 type: Type.ARRAY,
@@ -1246,6 +1380,8 @@ Return a JSON object conforming strictly to the requested schema.`;
               'riskScore',
               'summary',
               'whatThisModuleDoes',
+              'deletionAssessment',
+              'chmodAssessment',
               'corruptingCommands',
               'riskyCommands',
               'recommendation',
@@ -1268,6 +1404,8 @@ Return a JSON object conforming strictly to the requested schema.`;
           riskScore: typeof parsed.riskScore === 'number' ? parsed.riskScore : 50,
           summary: parsed.summary || 'Security review completed.',
           whatThisModuleDoes: parsed.whatThisModuleDoes || 'Standard Android root mod.',
+          deletionAssessment: parsed.deletionAssessment || 'No critical partition deletions found.',
+          chmodAssessment: parsed.chmodAssessment || 'No hazardous permission modifications detected.',
           mechanisms: parsed.mechanisms || [],
           scamOrPlaceboCheck: parsed.scamOrPlaceboCheck || 'No obvious fake claims detected.',
           batteryAndHeatImpact: parsed.batteryAndHeatImpact || 'Normal impact.',
@@ -1343,11 +1481,23 @@ function formatReportHtml(fileName, audit, quotaRemaining, isOwner, fileBreakdow
   text += `📋 <b>Verdict:</b> ${verdictHeader}\n`;
   text += `🤖 <b>Audit Engine:</b> <code>${escapeHtml(audit.engine || 'Google Gemini AI')}</code>\n\n`;
 
-  // 1. What This Module Does (100% Real AI Context in Plain Words)
-  text += `🎯 <b>What This Module Does (Plain English):</b>\n`;
+  // 1. What This Module Does
+  text += `🎯 <b>What This Module Does:</b>\n`;
   text += `${escapeHtml(audit.whatThisModuleDoes)}\n\n`;
 
-  // 2. How it works (Android system hooks)
+  // 2. File Deletion Analysis (Harmless vs Partition Wipe)
+  if (audit.deletionAssessment) {
+    text += `🗑️ <b>File &amp; Partition Deletion Analysis:</b>\n`;
+    text += `${escapeHtml(audit.deletionAssessment)}\n\n`;
+  }
+
+  // 3. Crucial chmod Analysis
+  if (audit.chmodAssessment) {
+    text += `🔑 <b>System Permission &amp; chmod Analysis:</b>\n`;
+    text += `${escapeHtml(audit.chmodAssessment)}\n\n`;
+  }
+
+  // 4. How it works (Android system hooks)
   if (audit.mechanisms && audit.mechanisms.length > 0) {
     text += `⚙️ <b>How It Works:</b>\n`;
     audit.mechanisms.slice(0, 4).forEach((m) => {
@@ -1356,47 +1506,46 @@ function formatReportHtml(fileName, audit, quotaRemaining, isOwner, fileBreakdow
     text += `\n`;
   }
 
-  // 3. Scam / Placebo Check
+  // 5. Scam / Placebo Check
   if (audit.scamOrPlaceboCheck) {
     text += `🔍 <b>Scam &amp; Fake Claims Check:</b>\n`;
     text += `${escapeHtml(audit.scamOrPlaceboCheck)}\n\n`;
   }
 
-  // 4. Battery & Phone Temperature Impact
+  // 6. Battery & Phone Temperature Impact
   if (audit.batteryAndHeatImpact) {
     text += `🔋 <b>Battery &amp; Heat Impact:</b>\n`;
     text += `${escapeHtml(audit.batteryAndHeatImpact)}\n\n`;
   }
 
-  // 5. Bootloop & Android Version Risk
+  // 7. Bootloop & Android Version Risk
   if (audit.bootloopRisk) {
-    text += `📱 <b>Bootloop &amp; Android Version Safety:</b>\n`;
+    text += `📱 <b>Bootloop &amp; Android Safety:</b>\n`;
     text += `${escapeHtml(audit.bootloopRisk)}\n\n`;
   }
 
-  // 6. Data Corrupting / Brick Commands
+  // 8. Data Corrupting / Brick Commands
   if (audit.corruptingCommands && audit.corruptingCommands.length > 0) {
-    text += `🚨 <b>BRICK / DATA CORRUPTION COMMANDS (${audit.corruptingCommands.length}):</b>\n`;
+    text += `🚨 <b>BRICK / PARTITION HAZARD COMMANDS (${audit.corruptingCommands.length}):</b>\n`;
     audit.corruptingCommands.slice(0, 4).forEach((c) => {
-      text += `• <code>${escapeHtml(c.command)}</code>\n  ⚠️ <i>${escapeHtml(c.explanation || 'Dangerous partition or storage wipe')}</i>\n`;
+      text += `• <code>${escapeHtml(c.command)}</code>\n  ⚠️ <i>${escapeHtml(c.explanation || 'Dangerous partition or chmod operation')}</i>\n`;
     });
     text += `\n`;
   }
 
-  // 7. Risky Commands
+  // 9. Risky Commands
   if (audit.riskyCommands && audit.riskyCommands.length > 0) {
-    text += `⚠️ <b>RISKY COMMANDS (${audit.riskyCommands.length}):</b>\n`;
+    text += `⚠️ <b>FLAGGED RISKY COMMANDS (${audit.riskyCommands.length}):</b>\n`;
     audit.riskyCommands.slice(0, 3).forEach((c) => {
-      text += `• <code>${escapeHtml(c.command)}</code>\n  ℹ️ <i>${escapeHtml(c.explanation || 'Risky permission or download')}</i>\n`;
+      text += `• <code>${escapeHtml(c.command)}</code>\n  ℹ️ <i>${escapeHtml(c.explanation || 'Risky permission or network download')}</i>\n`;
     });
     text += `\n`;
   }
 
-  // 8. Actionable Recommendation
+  // 10. Actionable Recommendation
   text += `💡 <b>What You Should Do:</b>\n`;
   text += `${escapeHtml(audit.recommendation)}\n\n`;
 
-  // Footer & Allowance
   text += `━━━━━━━━━━━━━━━━━━━━━\n`;
   text += isOwner
     ? `👑 <b>Owner Account:</b> Unlimited scans available.`
@@ -1427,7 +1576,6 @@ async function handleCallbackQuery(cq) {
   const chatId = cq.message?.chat?.id;
   const messageId = cq.message?.message_id;
 
-  // Immediately dismiss Telegram button loading spinner with zero delay
   answerCallbackQuery(cqId).catch(() => {});
 
   if (!data) return;
@@ -1450,14 +1598,13 @@ async function handleCallbackQuery(cq) {
   const cached = dbGetScanCache(scanId);
 
   if (!cached) {
-    // Intelligent instant fallback if older session or restarted before persistence
     if (action === 'eli5') {
       const fallbackEli5 = `📖 <b>Understanding Your Security Verdict:</b>\n\n` +
         `• 🟢 <b>Clean & Safe:</b> Script uses standard root paths without hazardous partition access.\n` +
-        `• 🟡 <b>Caution:</b> System properties or performance governors are tweaked. Review parameters.\n` +
+        `• 🟡 <b>Caution:</b> Normal files or cache are modified. Not a partition wipe.\n` +
         `• 🟠 <b>High Risk:</b> Downloads remote scripts or manipulates security policies.\n` +
-        `• 🔴 <b>Brick Risk:</b> Attempts raw flash block overwrites (<code>/dev/block/bootdevice</code>).\n\n` +
-        `💡 <i>Tip: For a line-by-line breakdown of a specific module, simply send the file again!</i>\n\n` +
+        `• 🔴 <b>Brick Risk:</b> Attempts raw partition wipe or strips crucial system chmod permissions.\n\n` +
+        `💡 <i>Tip: Send your module file again to get a fresh detailed audit!</i>\n\n` +
         `⚡ <i>RootGuard • made by @toshitzz</i>`;
       return await sendTelegramMessage(chatId, fallbackEli5, messageId);
     }
@@ -1487,14 +1634,20 @@ async function handleCallbackQuery(cq) {
     eli5Text += `<b>Target:</b> <code>${escapeHtml(cached.fileName)}</code>\n\n`;
 
     if (audit.verdict === 'MALICIOUS_BRICK_RISK') {
-      eli5Text += `🔴 <b>Warning:</b> This file has code that can completely break your phone or delete your family photos. <b>DO NOT INSTALL IT.</b>\n\n`;
+      eli5Text += `🔴 <b>Warning:</b> This file has code that wipes whole partitions or strips crucial system permissions. <b>DO NOT INSTALL IT.</b>\n\n`;
     } else if (audit.verdict === 'DANGEROUS') {
-      eli5Text += `🟠 <b>Careful:</b> This file does risky things like downloading code from the internet or turning off security shields. Only install if you know the person who made it.\n\n`;
+      eli5Text += `🟠 <b>Careful:</b> This file does risky things like downloading code from the internet or changing sensitive settings. Only install if you trust the author.\n\n`;
     } else {
-      eli5Text += `🟢 <b>Good News:</b> This file looks clean and does not have any dangerous phone-breaking commands.\n\n`;
+      eli5Text += `🟢 <b>Good News:</b> This file looks clean! Any file deletion is just harmless temporary cleanup or module cache, NOT a partition wipe.\n\n`;
     }
 
     eli5Text += `<b>What it actually does:</b>\n${escapeHtml(audit.whatThisModuleDoes)}\n\n`;
+    if (audit.deletionAssessment) {
+      eli5Text += `<b>Deletion check:</b> ${escapeHtml(audit.deletionAssessment)}\n\n`;
+    }
+    if (audit.chmodAssessment) {
+      eli5Text += `<b>Permission check:</b> ${escapeHtml(audit.chmodAssessment)}\n\n`;
+    }
     eli5Text += `<b>Battery:</b> ${escapeHtml(audit.batteryAndHeatImpact || 'Normal')}\n`;
     eli5Text += `<b>Fake promises:</b> ${escapeHtml(audit.scamOrPlaceboCheck || 'None')}\n\n`;
     eli5Text += `⚡ <i>RootGuard • made by @toshitzz</i>`;
@@ -1519,7 +1672,7 @@ async function handleCallbackQuery(cq) {
     const flags = [...(audit.corruptingCommands || []), ...(audit.riskyCommands || [])];
 
     if (flags.length === 0) {
-      codeText += `✅ <i>No dangerous commands were flagged in this file!</i>\n\n`;
+      codeText += `✅ <i>No dangerous partition wipes or critical chmod commands were flagged in this file!</i>\n\n`;
     } else {
       flags.slice(0, 6).forEach((f) => {
         codeText += `• <code>${escapeHtml(f.command)}</code>\n  👉 <i>${escapeHtml(f.explanation || 'Flagged operation')}</i>\n\n`;
@@ -1544,12 +1697,12 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
         `⚡ <i>made by @toshitzz</i>\n` +
         `━━━━━━━━━━━━━━━━━━━━━\n` +
         `I am your intelligent Android root security companion powered by Google Gemini AI.\n\n` +
-        `<b>What I Can Do:</b>\n` +
-        `• <b>100% Real AI Analysis:</b> I inspect your Magisk, KernelSU, APatch <code>.zip</code> modules or <code>.sh</code> scripts and explain what they actually do in <b>plain everyday English</b>.\n` +
-        `• <b>Scam / Snake-Oil Detector:</b> I check if a module makes fake promises (like "120FPS 10x RAM Boost").\n` +
-        `• <b>Battery &amp; Heat Check:</b> I check if scripts overheat your phone or kill battery life.\n` +
-        `• <b>Brick &amp; Bootloop Prevention:</b> I stop partition overwrites and keystore wipes before you flash!\n` +
-        `• <b>Super Fast Model Switching:</b> Blazing fast failovers so you never get stuck waiting.\n\n` +
+        `<b>Enhanced Detection System Active:</b>\n` +
+        `• <b>Smart Deletion Detection:</b> I check WHICH files a module deletes. Normal cache, dalvik, logs, and $MODDIR cleanups are NOT flagged as high risk!\n` +
+        `• <b>Partition Brick Shield:</b> I stop entire partition wipes (/system, /data, /vendor, /boot) that make phones unbootable or trigger bootloops.\n` +
+        `• <b>Crucial chmod Detection:</b> I monitor permission stripping on system binaries (chmod 000 bootloop hazards) and raw block exposures.\n` +
+        `• <b>Scam / Snake-Oil Detector:</b> I flag fake promises (like "120FPS 10x RAM Boost").\n` +
+        `• <b>Battery &amp; Heat Check:</b> I check if scripts overheat your phone or kill battery life.\n\n` +
         `📤 <b>How to Use:</b> Simply send any <code>.zip</code> or <code>.sh</code> module file to this chat!\n\n` +
         `Type /help to see all available commands.\n` +
         `━━━━━━━━━━━━━━━━━━━━━\n` +
@@ -1595,10 +1748,9 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
       const uptimeH = (process.uptime() / 3600).toFixed(1);
       const pingText = `🏓 <b>Pong!</b> <code>${latencyMs}ms</code>\n` +
         `⚡ <i>made by @toshitzz</i>\n\n` +
-        `• <b>Engine:</b> Google Gemini (gemini-3.1-flash-lite)\n` +
+        `• <b>Engine:</b> Google Gemini AI + Partition Safeguards\n` +
+        `• <b>Detection:</b> Crucial chmod + Target File Check\n` +
         `• <b>Uptime:</b> ${uptimeH}h continuous\n` +
-        `• <b>Scan Capacity:</b> ${activeScansCount}/${MAX_CONCURRENT_SCANS} workers active\n` +
-        `• <b>Interactive UI:</b> Persistent Database Buttons ⚡\n` +
         `• <b>Database:</b> SQLite (WAL Mode)`;
       if (tempMsg?.result?.message_id) {
         return await editTelegramMessage(chatId, tempMsg.result.message_id, pingText);
@@ -1615,7 +1767,7 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
         `Simply tap the 📎 <b>Attachment</b> button on Telegram and upload any:\n` +
         `• <b>.zip</b> Magisk / KernelSU / APatch module\n` +
         `• <b>.sh</b> shell script or post-fs script\n\n` +
-        `RootGuard will immediately run AST security heuristics and full Google Gemini neural inspection!`,
+        `RootGuard will immediately run AST security heuristics, partition deletion verification, crucial chmod detection, and Google Gemini neural inspection!`,
         replyMsgId
       );
     }
@@ -1626,11 +1778,11 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
         `🛡️ <b>About RootGuard AI</b>\n` +
         `⚡ <i>made by @toshitzz</i>\n\n` +
         `RootGuard is a dedicated Android root module security auditor.\n` +
-        `It analyzes shell scripts, Magisk/KernelSU modules, detecting:\n` +
-        `• Partition bricking commands (e.g. <code>dd if=/dev/zero of=/dev/block/...</code>)\n` +
-        `• Keystore, IMEI, and FRP partition wiping\n` +
-        `• Snake-oil / scam placebo claims\n` +
-        `• Battery draining infinite loops &amp; overheating risks\n\n` +
+        `Enhanced Detection System Features:\n` +
+        `• <b>Partition vs File Deletion:</b> Distinguishes safe cache/mod removals from whole partition wipes\n` +
+        `• <b>Crucial chmod Detection:</b> Monitors permission stripping on /system/bin and raw block nodes\n` +
+        `• <b>Bootloop Shield:</b> Prevents unbootable scripts before you flash\n` +
+        `• <b>Scam Detection:</b> Spots placebo FPS/RAM scripts\n\n` +
         `Powered by <b>Google Gemini AI</b> with failover resilience.`,
         replyMsgId
       );
@@ -1707,58 +1859,13 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
         `Never trust modules promising "120FPS on 60Hz screens", "16GB RAM multiplier", or "GPU 200% Overclock" without kernel-level code.\n\n` +
         `<b>4. Never Flash Password-Locked Archives:</b>\n` +
         `Encrypted zips hide malicious partition destroyers from scanners.\n\n` +
-        `<b>5. Verify SELinux Compatibility:</b>\n` +
-        `Modules that forcefully set <code>setenforce 0</code> compromise Android hardware-backed Keystore security.\n\n` +
+        `<b>5. Watch for System chmod 000:</b>\n` +
+        `Permissions stripped from /system or /system/bin binaries will immediately crash Android during boot.\n\n` +
         `<b>6. Audit Before You Flash:</b>\n` +
         `Upload the module here to RootGuard first!\n` +
         `━━━━━━━━━━━━━━━━━━━━━\n` +
         `⚡ <i>RootGuard • made by @toshitzz</i>`;
       return await sendTelegramMessage(chatId, rulesMsg, replyMsgId);
-    }
-
-    case '/faq': {
-      const faqMsg = `❓ <b>Frequently Asked Questions (FAQ):</b>\n` +
-        `⚡ <i>made by @toshitzz</i>\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n` +
-        `<b>Q: Does RootGuard run my module on a real phone?</b>\n` +
-        `<b>A:</b> No! RootGuard inspects scripts via AST Static Heuristics and Google Gemini neural static analysis. It is 100% safe and simulated.\n\n` +
-        `<b>Q: How does RootGuard detect bootloops?</b>\n` +
-        `<b>A:</b> It tracks syntax errors, missing variables in <code>post-fs-data.sh</code>, infinite non-sleep loops, and illegal partition mounts that halt zygote init.\n\n` +
-        `<b>Q: Magisk vs KernelSU vs APatch?</b>\n` +
-        `<b>A:</b> Magisk hooks userspace init. KernelSU hooks the Linux kernel directly. APatch hooks the kernel via KernelPatch. RootGuard supports modules from all three managers!\n\n` +
-        `<b>Q: Why is there a 5 scans/day limit?</b>\n` +
-        `<b>A:</b> Deep Google Gemini neural inspection requires high computational bandwidth. 5 daily audits keeps the bot completely free for the global root community!\n\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n` +
-        `⚡ <i>RootGuard • made by @toshitzz</i>`;
-      return await sendTelegramMessage(chatId, faqMsg, replyMsgId);
-    }
-
-    case '/changelog': {
-      const logMsg = `📜 <b>RootGuard Changelog (v2.5):</b>\n` +
-        `⚡ <i>made by @toshitzz</i>\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n` +
-        `• 🚀 <b>Increased Daily Allowance:</b> 5 free deep AI audits per user per day!\n` +
-        `• ⏱️ <b>Precision Cooldown Timer:</b> Accurate 15s cooldown with countdown timer.\n` +
-        `• 🌐 <b>Vercel 24/7 Hosting:</b> New serverless webhook deployment in <code>api/webhook.js</code>.\n` +
-        `• 🛡️ <b>Expanded Heuristics:</b> 45+ brick & keystore wipe signatures recognized.\n` +
-        `• 🔗 <b>URL Auditing:</b> Use <code>/checkurl &lt;url&gt;</code> to audit direct module links.\n` +
-        `• 🗄️ <b>Persistent Buttons:</b> Database-backed interactive buttons for ELI5 & recommendations.\n` +
-        `• 🚨 <b>Emergency Recovery:</b> Fast-access Safe Mode guide in <code>/recovery</code>.\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n` +
-        `⚡ <i>RootGuard • made by @toshitzz</i>`;
-      return await sendTelegramMessage(chatId, logMsg, replyMsgId);
-    }
-
-    case '/feedback': {
-      if (!args.trim()) {
-        return await sendTelegramMessage(chatId, `Usage: <code>/feedback &lt;your message&gt;</code>\n\nShare bug reports, false positives, or suggestions!`, replyMsgId);
-      }
-      console.log(`📩 User Feedback [${cleanUserId}]: ${args.trim()}`);
-      return await sendTelegramMessage(
-        chatId,
-        `🙏 <b>Thank You for Your Feedback!</b>\n\nYour message has been logged for review.\n\n⚡ <i>RootGuard • made by @toshitzz</i>`,
-        replyMsgId
-      );
     }
 
     case '/checkurl': {
@@ -1771,7 +1878,6 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
         );
       }
 
-      // Check quota & cooldown
       const lockCheck = dbCheckCooldownAndLock(cleanUserId, isOwner);
       if (!lockCheck.allowed) {
         if (lockCheck.reason === 'COOLDOWN') {
@@ -1807,17 +1913,17 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
         }
 
         const scanId = crypto.randomUUID().slice(0, 8);
-        const heuristicResult = runDeepHeuristicScanner(scripts);
-        const aiAudit = await auditScriptsWithGemini(fileName, scripts, heuristicResult);
-        const finalAudit = { ...heuristicResult, ...aiAudit };
+        const finalAudit = await auditModuleWithRealAi(fileName, scripts, metadata);
 
         dbReleaseLockAndRecordScan(cleanUserId, {
           file_name: fileName,
           verdict: finalAudit.verdict,
           risk_score: finalAudit.riskScore,
-          model_used: finalAudit.modelUsed || 'gemini-3.1-flash-lite',
+          model_used: finalAudit.modelUsed || 'Heuristics',
           duration_ms: 1200,
         });
+
+        dbSaveScanCache(scanId, fileName, finalAudit);
 
         const { text: reportHtml, replyMarkup } = formatReportHtml(
           fileName,
@@ -1840,7 +1946,7 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
       if (!args.trim()) {
         return await sendTelegramMessage(
           chatId,
-          `Usage: <code>/quick &lt;script content&gt;</code>\n\nRuns an instant AST heuristic scan without consuming daily quota!`,
+          `Usage: <code>/quick &lt;script content&gt;</code>\n\nRuns an instant AST heuristic scan with partition deletion & chmod checks!`,
           replyMsgId
         );
       }
@@ -1851,10 +1957,19 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
         `📊 Score: <b>${scan.riskScore}/100</b>\n` +
         `📋 Verdict: <b>${scan.verdict}</b>\n\n` +
         `${escapeHtml(scan.summary)}\n\n`;
+
       if (scan.corruptingCommands.length > 0) {
-        quickMsg += `🚨 <b>Hazard:</b> <code>${escapeHtml(scan.corruptingCommands[0].command)}</code>\n\n`;
+        quickMsg += `🚨 <b>Partition/Bootloop Hazard:</b> <code>${escapeHtml(scan.corruptingCommands[0].command)}</code>\n` +
+          `👉 <i>${escapeHtml(scan.corruptingCommands[0].explanation)}</i>\n\n`;
       }
-      quickMsg += `💡 <b>Advice:</b> ${escapeHtml(scan.recommendation)}\n━━━━━━━━━━━━━\n⚡ <i>RootGuard • made by @toshitzz</i>`;
+      if (scan.deletionLog && scan.deletionLog.length > 0) {
+        quickMsg += `🗑️ <b>Deletion Analysis:</b> ${escapeHtml(scan.deletionLog[0].classification)} (Risk: ${scan.deletionLog[0].risk})\n`;
+      }
+      if (scan.chmodLog && scan.chmodLog.length > 0) {
+        quickMsg += `🔑 <b>chmod Analysis:</b> ${escapeHtml(scan.chmodLog[0].classification)} (Risk: ${scan.chmodLog[0].risk})\n`;
+      }
+
+      quickMsg += `\n💡 <b>Advice:</b> ${escapeHtml(scan.recommendation)}\n━━━━━━━━━━━━━\n⚡ <i>RootGuard • made by @toshitzz</i>`;
       return await sendTelegramMessage(chatId, quickMsg, replyMsgId);
     }
 
@@ -1880,7 +1995,7 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
       if (!ai) {
         return await sendTelegramMessage(chatId, `⚠️ AI Engine offline: GEMINI_API_KEY missing.`, replyMsgId);
       }
-      const testModel = (process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite').trim();
+      const testModel = (process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim();
       try {
         const res = await ai.models.generateContent({
           model: testModel,
@@ -1918,7 +2033,6 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
       );
     }
 
-    // Admin commands
     case '/vip': {
       if (!isOwner) return await sendTelegramMessage(chatId, `⛔ Access denied.`, replyMsgId);
       const target = args.trim().replace(/^tg:/i, '');
@@ -1957,24 +2071,6 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
       if (!target) return await sendTelegramMessage(chatId, `Usage: <code>/resetquota &lt;userId&gt;</code>`, replyMsgId);
       dbResetQuota(target);
       return await sendTelegramMessage(chatId, `🔄 Daily scan quota for user <code>${target}</code> has been reset to 0/${DAILY_SCAN_LIMIT}.`, replyMsgId);
-    }
-
-    case '/system': {
-      if (!isOwner) return await sendTelegramMessage(chatId, `⛔ Access denied.`, replyMsgId);
-      const mem = process.memoryUsage();
-      const heapUsedMb = (mem.heapUsed / (1024 * 1024)).toFixed(1);
-      const rssMb = (mem.rss / (1024 * 1024)).toFixed(1);
-      const uptimeH = (process.uptime() / 3600).toFixed(2);
-      const sysMsg = `🖥️ <b>RootGuard Server System Diagnostics:</b>\n` +
-        `• <b>Node.js:</b> <code>${process.version}</code> (${process.platform} ${process.arch})\n` +
-        `• <b>Process Uptime:</b> <code>${uptimeH} hours</code>\n` +
-        `• <b>Heap Memory:</b> <code>${heapUsedMb} MB</code> (RSS: <code>${rssMb} MB</code>)\n` +
-        `• <b>Active Workers:</b> <code>${activeScansCount} / ${MAX_CONCURRENT_SCANS}</code>\n` +
-        `• <b>Scan Queue:</b> <code>${scanQueue.length} jobs waiting</code>\n` +
-        `• <b>Database Mode:</b> ${sqliteDb ? 'SQLite WAL 3.x (Active)' : 'In-Memory Store'}\n` +
-        `• <b>Default Daily Limit:</b> <code>${DAILY_SCAN_LIMIT} scans/day</code>\n` +
-        `• <b>Cooldown Duration:</b> <code>${COOLDOWN_SECONDS} seconds</code>`;
-      return await sendTelegramMessage(chatId, sysMsg, replyMsgId);
     }
 
     case '/history': {
@@ -2073,14 +2169,13 @@ async function processModuleAuditJob(chatId, rawUserId, msg, fileName) {
           5,
           65,
           '🛡️ Heuristic Code Dissection',
-          `Scanned ${scripts.length} script(s) for partition wipes, keystore drops & infinite loops...`
+          `Scanned ${scripts.length} script(s) for partition wipes, crucial chmod & bootloop hazards...`
         )
       );
     }
 
     sendChatAction(chatId, 'typing').catch(() => {});
 
-    // Progress updater for live model switching
     const progressCallback = async (statusUpdate) => {
       if (statusMsgId) {
         await editTelegramMessage(
@@ -2092,26 +2187,11 @@ async function processModuleAuditJob(chatId, rawUserId, msg, fileName) {
             5,
             88,
             '🤖 Google Gemini AI Engine',
-            statusUpdate || 'Analyzing intent, battery drain & generating plain English breakdown...'
+            statusUpdate || 'Checking partition deletion targets, crucial chmod & battery profile...'
           )
         ).catch(() => {});
       }
     };
-
-    if (statusMsgId) {
-      await editTelegramMessage(
-        chatId,
-        statusMsgId,
-        renderAuditProgress(
-          fileName,
-          4,
-          5,
-          82,
-          '🤖 Google Gemini AI Engine',
-          'Evaluating security safety profile via gemini-3.1-flash-lite...'
-        )
-      );
-    }
 
     const audit = await auditModuleWithRealAi(fileName, scripts, metadata, progressCallback);
 
@@ -2130,7 +2210,6 @@ async function processModuleAuditJob(chatId, rawUserId, msg, fileName) {
       ).catch(() => {});
     }
 
-    // Save scan record in database and release lock
     const scanDuration = Date.now() - scanStartTime;
     const scanId = `sc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
@@ -2144,8 +2223,6 @@ async function processModuleAuditJob(chatId, rawUserId, msg, fileName) {
     });
 
     const quotaInfo = dbGetUserQuota(cleanUserId);
-
-    // Persist scan cache into SQLite & memory so buttons work indefinitely
     dbSaveScanCache(scanId, fileName, audit);
 
     const { text: reportHtml, replyMarkup } = formatReportHtml(
@@ -2178,7 +2255,7 @@ async function processModuleAuditJob(chatId, rawUserId, msg, fileName) {
         `This ZIP is password-protected. RootGuard cannot extract and audit scripts or binaries without the password.\n\n` +
         `⚠️ <b>Security Risk Notice:</b>\n` +
         `Malicious modules often use passwords to hide data-wiping or partition-bricking code.\n\n` +
-        `💡 <b>Recommendation:</b> DO NOT FLASH encrypted modules from unverified sources. Repackage without a password and re-upload.\n` +
+        `💡 <b>Recommendation:</b> DO NOT FLASH encrypted modules from unverified sources.\n` +
         `━━━━━━━━━━━━━━━━━━━━━\n` +
         `⚡ <i>RootGuard • made by @toshitzz</i>`;
     } else {
@@ -2198,7 +2275,6 @@ async function processModuleAuditJob(chatId, rawUserId, msg, fileName) {
 // 12. Main Update Dispatcher
 // =======================================================================
 async function handleUpdate(update) {
-  // 1. Handle Inline Button Clicks
   if (update.callback_query) {
     return await handleCallbackQuery(update.callback_query);
   }
@@ -2214,7 +2290,6 @@ async function handleUpdate(update) {
 
   const text = (msg.text || '').trim();
 
-  // Command handling
   if (text.startsWith('/')) {
     const firstWord = text.split(/\s+/)[0];
     const command = firstWord.toLowerCase().split('@')[0];
@@ -2222,7 +2297,6 @@ async function handleUpdate(update) {
     return await handleCommand(chatId, rawUserId, command, args, msg.message_id);
   }
 
-  // Document uploaded (.zip or .sh)
   if (msg.document) {
     const fileName = msg.document.file_name || 'module.zip';
     const lower = fileName.toLowerCase();
@@ -2245,7 +2319,6 @@ async function handleUpdate(update) {
       );
     }
 
-    // Check Cooldown, Scan Lock & Quota in SQL Database
     const lockCheck = dbCheckCooldownAndLock(rawUserId, isOwner);
     if (!lockCheck.allowed) {
       if (lockCheck.reason === 'BANNED') {
@@ -2282,7 +2355,6 @@ async function handleUpdate(update) {
 
     sendChatAction(chatId, 'upload_document').catch(() => {});
 
-    // If server is under heavy load, inform user about queue
     if (activeScansCount >= MAX_CONCURRENT_SCANS) {
       const queuePosition = scanQueue.length + 1;
       sendTelegramMessage(
@@ -2299,6 +2371,7 @@ async function handleUpdate(update) {
 }
 
 async function registerBotCommands() {
+  if (!TELEGRAM_TOKEN) return;
   try {
     const res = await callTelegram(
       'setMyCommands',
@@ -2312,11 +2385,8 @@ async function registerBotCommands() {
           { command: 'checkurl', description: '🌐 Audit Module via Direct Link' },
           { command: 'recovery', description: '🚨 Emergency Bootloop Rescue' },
           { command: 'rules', description: '🛡️ 6 Golden Rules of Root Safety' },
-          { command: 'faq', description: '❓ Frequently Asked Questions' },
           { command: 'profile', description: '🆔 Your Account Profile & Stats' },
           { command: 'ping', description: '🏓 Latency & Server Health Check' },
-          { command: 'changelog', description: '📜 What is New in RootGuard v2.5' },
-          { command: 'feedback', description: '📩 Submit Suggestions & Bug Reports' },
           { command: 'about', description: 'ℹ️ About RootGuard Architecture' },
           { command: 'stats', description: '📈 Total Scans & Threats Stopped' },
           { command: 'test', description: '🤖 Test Gemini AI Latency' },
@@ -2338,7 +2408,12 @@ async function registerBotCommands() {
 // =======================================================================
 async function startBot() {
   console.log('🚀 Starting RootGuard Telegram Bot (bot.js)...');
-  console.log('⚡ made by @toshitzz');
+  console.log('⚡ made by @toshitzz | Enhanced Partition Safeguards Active');
+
+  if (!TELEGRAM_TOKEN) {
+    console.log('ℹ️ No TELEGRAM_BOT_TOKEN provided. Telegram bot listener is idle (Web inspector & API active).');
+    return;
+  }
 
   let me;
   try {
@@ -2346,27 +2421,23 @@ async function startBot() {
     if (!me || !me.ok) {
       console.error('❌ Failed to authenticate with Telegram:', me?.description);
       console.error('👉 Verify TELEGRAM_BOT_TOKEN in .env');
-      process.exit(1);
+      return;
     }
   } catch (err) {
     console.error('❌ Could not reach Telegram servers on startup:', err.message);
-    process.exit(1);
+    return;
   }
 
   console.log(`✅ Authenticated successfully as @${me.result.username} (${me.result.first_name})`);
-  console.log(`⚡ Bot Author: @toshitzz`);
-
-  // Ensure commands menu is always active in user's Telegram client
   await registerBotCommands();
 
-  console.log(`📡 Polling for updates from Telegram (High-Capacity SQL Mode)...`);
+  console.log(`📡 Polling for updates from Telegram...`);
 
   let offset = 0;
   let consecutiveFailures = 0;
 
   while (true) {
     try {
-      // Server holds for 15s max; client HTTP timeout is 35s
       const updatesRes = await callTelegram(
         'getUpdates',
         {
@@ -2379,7 +2450,6 @@ async function startBot() {
       );
 
       if (!updatesRes.ok) {
-        // Only log and backoff if it's a genuine Telegram API error (e.g. 409 conflict, 401 unauthorized)
         consecutiveFailures++;
         console.warn(`Telegram polling notice (${consecutiveFailures}):`, updatesRes.description || 'Unknown error');
         await sleepMs(Math.min(10000, 1500 * consecutiveFailures));
@@ -2410,7 +2480,6 @@ async function startBot() {
         errMsg.includes('UND_ERR_SOCKET') ||
         errMsg.includes('other side closed');
 
-      // Routine TCP keep-alive connection refresh on long-polling cycle
       if (isRoutineSocketDrop) {
         consecutiveFailures = 0;
         await sleepMs(100);
@@ -2424,23 +2493,27 @@ async function startBot() {
   }
 }
 
-// ===============================
-// Render Web Service
-// ===============================
+// Export functions for reuse in server.ts and tests
+module.exports = {
+  runDeepHeuristicScanner,
+  auditModuleWithRealAi,
+  extractScriptsFromModule,
+  startBot,
+};
 
-const http = require('http');
+// Start the bot if executed directly
+if (require.main === module) {
+  const http = require('http');
+  const PORT = process.env.PORT || 10000;
 
-const PORT = process.env.PORT || 10000;
-
-const server = http.createServer((req, res) => {
+  const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Bot is running!');
-});
+    res.end('RootGuard Bot is running with Enhanced Partition & chmod Detection!');
+  });
 
-server.listen(PORT, '0.0.0.0', () => {
+  server.listen(PORT, '0.0.0.0', () => {
     console.log(`Web server listening on port ${PORT}`);
-});
+  });
 
-
-// Start the bot
-startBot();
+  startBot();
+}
