@@ -23,7 +23,6 @@ process.on('uncaughtException', (err) => {
 });
 
 const TELEGRAM_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
-const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const GROQ_API_KEY = (process.env.GROQ_API_KEY || '').trim();
 const GROQ_MODEL = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').trim();
 const DATABASE_URL = (process.env.DATABASE_URL || '').trim();
@@ -39,8 +38,6 @@ const OWNER_IDS = (process.env.OWNER_ID || '')
 
 console.log('⚡ RootGuard Telegram Bot • made by @toshitzz');
 console.log(`🔑 Telegram: ${TELEGRAM_TOKEN ? 'Token Configured' : 'Offline (Add TELEGRAM_BOT_TOKEN)'}`);
-console.log(`🔑 Gemini AI: ${GEMINI_API_KEY ? 'Active' : 'Offline (Add GEMINI_API_KEY)'}`);
-console.log(`🔑 Groq AI: ${GROQ_API_KEY ? `Active (Default: ${GROQ_MODEL})` : 'Offline (Add GROQ_API_KEY)'}`);
 console.log(`👑 Configured Owner IDs: ${OWNER_IDS.length ? OWNER_IDS.join(', ') : 'None'}`);
 
 // =======================================================================
@@ -847,9 +844,310 @@ async function dbGetUserHistory(userId, limit = 5) {
 }
 
 // =======================================================================
-// 2. Groq Free-Plan Multi-Model Discovery & Dynamic Failover Engine
+// 2. Google Gemini Multi-Key Pool & Dynamic Model Engine (Up to 4 Keys)
+//    - Automatic Failover when any key hits quota/rate limits
+//    - Real-time Telegram user alert: "Switching to Backup Key, please wait..."
+//    - Dynamic discovery of all available working Gemini models
 // =======================================================================
-// Verified Free-Plan Chat Models on Groq:
+
+const GEMINI_CANDIDATE_MODELS = [
+  'gemini-2.5-flash',
+  'gemini-3.8-flash',
+  'gemini-2.5-pro',
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-lite',
+  'gemini-1.5-flash',
+  'gemini-1.5-pro',
+];
+
+class GoogleKeyPoolManager {
+  constructor() {
+    this.keys = [];
+    this.activeKeyIndex = 1;
+    this.preferredModel = 'gemini-2.5-flash';
+    this.discoveredModels = new Set(GEMINI_CANDIDATE_MODELS);
+    this.modelLatencies = new Map();
+    this.initKeys();
+  }
+
+  initKeys() {
+    const rawKeys = [];
+    const envVars = [
+      process.env.GEMINI_API_KEY,
+      process.env.GEMINI_API_KEY_1,
+      process.env.GEMINI_API_KEY_2,
+      process.env.GEMINI_API_KEY_3,
+      process.env.GEMINI_API_KEY_4,
+      process.env.GEMINI_API_KEYS,
+    ];
+
+    for (const val of envVars) {
+      if (!val) continue;
+      const parts = String(val).split(',').map((s) => s.trim()).filter(Boolean);
+      for (const p of parts) {
+        if (!rawKeys.includes(p)) rawKeys.push(p);
+      }
+    }
+
+    // Up to 4 Google Gemini API keys
+    const selected = rawKeys.slice(0, 4);
+    this.keys = selected.map((k, idx) => {
+      const masked = k.length > 8 ? `${k.slice(0, 6)}...${k.slice(-4)}` : `Key #${idx + 1}`;
+      return {
+        index: idx + 1,
+        key: k,
+        masked,
+        status: 'HEALTHY', // 'HEALTHY' | 'EXHAUSTED' | 'ERROR'
+        exhaustedUntil: 0,
+        requestsCount: 0,
+        successCount: 0,
+        failureCount: 0,
+        lastUsed: 0,
+        lastLatencyMs: 0,
+        lastError: null,
+      };
+    });
+
+    this.activeKeyIndex = this.keys.length > 0 ? 1 : 0;
+    console.log(`🔑 Google Gemini Pool: ${this.keys.length} Key(s) Loaded`);
+    this.keys.forEach((k) => console.log(`   • Key #${k.index}: ${k.masked}`));
+  }
+
+  getActiveKey() {
+    if (this.keys.length === 0) return null;
+    const now = Date.now();
+
+    // Check current active key
+    const current = this.keys.find((k) => k.index === this.activeKeyIndex);
+    if (current && (current.exhaustedUntil <= now || current.status === 'HEALTHY')) {
+      if (current.exhaustedUntil <= now && current.status === 'EXHAUSTED') {
+        current.status = 'HEALTHY';
+        current.exhaustedUntil = 0;
+      }
+      return current;
+    }
+
+    // Look for next non-exhausted key
+    for (const k of this.keys) {
+      if (k.exhaustedUntil <= now) {
+        k.status = 'HEALTHY';
+        k.exhaustedUntil = 0;
+        this.activeKeyIndex = k.index;
+        return k;
+      }
+    }
+
+    // If all are currently in cooldown, return the one whose cooldown expires soonest
+    const sorted = [...this.keys].sort((a, b) => a.exhaustedUntil - b.exhaustedUntil);
+    return sorted[0] || null;
+  }
+
+  markKeyExhausted(index, reason = 'Quota Limit Reached') {
+    const k = this.keys.find((x) => x.index === index);
+    if (k) {
+      k.status = 'EXHAUSTED';
+      k.exhaustedUntil = Date.now() + 10 * 60 * 1000; // 10-minute cooldown
+      k.lastError = reason;
+      k.failureCount++;
+    }
+  }
+
+  switchActiveKey(index) {
+    const k = this.keys.find((x) => x.index === index);
+    if (k) {
+      this.activeKeyIndex = index;
+      return true;
+    }
+    return false;
+  }
+
+  setPreferredModel(model) {
+    this.preferredModel = model;
+  }
+
+  async queryWithAutoFailover({ prompt, jsonMode = false, onSwitchNotice = null, preferredModel = null }) {
+    if (this.keys.length === 0) {
+      throw new Error('No Google Gemini API key configured. Please add GEMINI_API_KEY in .env');
+    }
+
+    let attempts = 0;
+    const maxAttempts = this.keys.length;
+    let lastError = null;
+
+    while (attempts < maxAttempts) {
+      attempts++;
+      const currentKey = this.getActiveKey();
+      if (!currentKey) break;
+
+      const startTime = Date.now();
+      currentKey.requestsCount++;
+      currentKey.lastUsed = startTime;
+
+      const modelsToTry = [
+        preferredModel,
+        this.preferredModel,
+        ...GEMINI_CANDIDATE_MODELS,
+      ].filter((m, i, arr) => m && arr.indexOf(m) === i);
+
+      let keySuccess = false;
+      let modelError = null;
+
+      for (const model of modelsToTry) {
+        try {
+          const ai = new GoogleGenAI({ apiKey: currentKey.key });
+          const config = jsonMode ? { responseMimeType: 'application/json' } : {};
+          const res = await ai.models.generateContent({
+            model,
+            contents: prompt,
+            config,
+          });
+
+          const elapsed = Date.now() - startTime;
+          currentKey.lastLatencyMs = elapsed;
+          currentKey.successCount++;
+          currentKey.status = 'HEALTHY';
+          this.preferredModel = model; // Keep working model active
+
+          return {
+            text: res.text || '',
+            keyIndex: currentKey.index,
+            maskedKey: currentKey.masked,
+            modelUsed: model,
+            latencyMs: elapsed,
+          };
+        } catch (err) {
+          modelError = err;
+          const msg = (err.message || '').toLowerCase();
+          const isQuota =
+            msg.includes('resource_exhausted') ||
+            msg.includes('429') ||
+            msg.includes('quota') ||
+            msg.includes('rate limit');
+
+          if (isQuota) {
+            // Key quota exhausted! Exit model loop immediately to rotate key.
+            break;
+          }
+          // If model is unsupported or 404, smoothly try next candidate model
+          console.warn(`[Google Key #${currentKey.index} Model ${model}]: ${err.message.slice(0, 80)}. Trying next candidate model...`);
+        }
+      }
+
+      const errMsg = (modelError?.message || '').toLowerCase();
+      const isQuota =
+        errMsg.includes('resource_exhausted') ||
+        errMsg.includes('429') ||
+        errMsg.includes('quota') ||
+        errMsg.includes('rate limit');
+
+      if (isQuota) {
+        this.markKeyExhausted(currentKey.index, 'Resource/Quota Limit Reached');
+        const nextKey = this.getActiveKey();
+
+        if (nextKey && nextKey.index !== currentKey.index) {
+          console.warn(`⚠️ Google API Key #${currentKey.index} quota reached! Switching to Backup Key #${nextKey.index}`);
+          if (onSwitchNotice) {
+            try {
+              await onSwitchNotice(
+                `⚠️ <b>Google Gemini API Key #${currentKey.index} quota limit reached!</b>\n` +
+                `🔄 <i>Switching to Backup Key #${nextKey.index}, please wait...</i>`
+              );
+            } catch (noticeErr) {}
+          }
+          // Continue to next key in pool
+          continue;
+        } else {
+          lastError = new Error(`All ${this.keys.length} Google Gemini API keys are currently cooling down from quota limits.`);
+          break;
+        }
+      } else {
+        currentKey.failureCount++;
+        currentKey.lastError = modelError?.message || 'Unknown error';
+        lastError = modelError;
+      }
+    }
+
+    throw lastError || new Error('Google Gemini AI audit failed.');
+  }
+
+  // Benchmark all candidate Gemini models on active key
+  async benchmarkAllModels() {
+    const active = this.getActiveKey();
+    if (!active) return [];
+
+    const results = [];
+    for (const model of GEMINI_CANDIDATE_MODELS) {
+      const t0 = Date.now();
+      try {
+        const ai = new GoogleGenAI({ apiKey: active.key });
+        const res = await ai.models.generateContent({
+          model,
+          contents: 'Reply with OK',
+        });
+        const lat = Date.now() - t0;
+        this.modelLatencies.set(model, lat);
+        results.push({
+          model,
+          status: 'AVAILABLE',
+          latencyMs: lat,
+          sample: res.text?.trim() || 'OK',
+          isActive: model === this.preferredModel,
+        });
+      } catch (err) {
+        results.push({
+          model,
+          status: 'UNAVAILABLE',
+          latencyMs: Date.now() - t0,
+          error: err.message.slice(0, 80),
+          isActive: model === this.preferredModel,
+        });
+      }
+    }
+    return results;
+  }
+
+  // Benchmark all 4 Google API keys simultaneously
+  async benchmarkAllKeys() {
+    const results = [];
+    for (const k of this.keys) {
+      const t0 = Date.now();
+      try {
+        const ai = new GoogleGenAI({ apiKey: k.key });
+        await ai.models.generateContent({
+          model: this.preferredModel,
+          contents: 'Reply with OK',
+        });
+        const lat = Date.now() - t0;
+        k.lastLatencyMs = lat;
+        k.status = 'HEALTHY';
+        results.push({
+          index: k.index,
+          masked: k.masked,
+          status: 'HEALTHY',
+          latencyMs: lat,
+          isActive: k.index === this.activeKeyIndex,
+        });
+      } catch (err) {
+        const isQuota = (err.message || '').toLowerCase().includes('quota') || (err.message || '').includes('429');
+        results.push({
+          index: k.index,
+          masked: k.masked,
+          status: isQuota ? 'EXHAUSTED' : 'ERROR',
+          latencyMs: Date.now() - t0,
+          error: err.message.slice(0, 80),
+          isActive: k.index === this.activeKeyIndex,
+        });
+      }
+    }
+    return results;
+  }
+}
+
+const googleKeyPool = new GoogleKeyPoolManager();
+
+// =======================================================================
+// (Secondary Optional) Groq Free-Plan Failover Engine
+// =======================================================================
 const KNOWN_FREE_GROQ_MODELS = [
   'llama-3.3-70b-versatile',
   'llama-3.1-8b-instant',
@@ -867,9 +1165,8 @@ const groqTelemetry = {
   modelErrors: new Map(),
 };
 
-// Query Groq API with automatic free-model failover
 async function queryGroqChatWithAutoFailover({ messages, jsonMode = false, temperature = 0.1, preferredModel = null }) {
-  if (!GROQ_API_KEY) throw new Error('Groq API Key not configured in .env (add GROQ_API_KEY).');
+  if (!GROQ_API_KEY) throw new Error('Groq API Key not configured in .env.');
 
   const modelsToTry = [
     preferredModel,
@@ -915,53 +1212,10 @@ async function queryGroqChatWithAutoFailover({ messages, jsonMode = false, tempe
     } catch (err) {
       lastError = err;
       groqTelemetry.modelErrors.set(model, err.message);
-      console.warn(`Groq model [${model}] failed (${err.message.slice(0, 60)}). Trying next free model...`);
     }
   }
 
-  throw new Error(`All available Groq free models failed. Last error: ${lastError?.message}`);
-}
-
-// Discover all currently accessible models on Groq via official endpoint
-async function discoverLiveGroqModels() {
-  if (!GROQ_API_KEY) return { ok: false, error: 'No GROQ_API_KEY provided' };
-  try {
-    const res = await fetch('https://api.groq.com/openai/v1/models', {
-      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}` },
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    const all = data.data || [];
-    // Filter to active chat models compatible with the free plan
-    const activeChatModels = all
-      .filter((m) => m.active !== false && !m.id.includes('whisper') && !m.id.includes('guard'))
-      .map((m) => m.id);
-
-    return { ok: true, models: activeChatModels };
-  } catch (err) {
-    return { ok: false, error: err.message, fallbackModels: KNOWN_FREE_GROQ_MODELS };
-  }
-}
-
-// Benchmark and ping every free Groq model
-async function testAllGroqModels() {
-  const models = KNOWN_FREE_GROQ_MODELS;
-  const results = [];
-
-  for (const model of models) {
-    const t0 = Date.now();
-    try {
-      const res = await queryGroqChatWithAutoFailover({
-        messages: [{ role: 'user', content: 'Reply with the word OK and nothing else.' }],
-        preferredModel: model,
-      });
-      results.push({ model, status: 'HEALTHY', latencyMs: res.latencyMs });
-    } catch (e) {
-      results.push({ model, status: 'UNAVAILABLE', error: e.message.slice(0, 80), latencyMs: Date.now() - t0 });
-    }
-  }
-
-  return results;
+  throw new Error(`All available Groq free models failed: ${lastError?.message}`);
 }
 
 // =======================================================================
@@ -1128,8 +1382,8 @@ function runDeepHeuristicScanner(scripts) {
   };
 }
 
-// AI Audit with Google Gemini & Groq Auto-Failover
-async function auditModuleWithAI(fileName, scripts, metadata) {
+// AI Audit with Google Gemini Multi-Key & Secondary Groq Auto-Failover
+async function auditModuleWithAI(fileName, scripts, metadata, onSwitchNotice = null) {
   const heuristic = runDeepHeuristicScanner(scripts);
   const formattedScripts = scripts
     .slice(0, 8)
@@ -1157,25 +1411,30 @@ Return a valid JSON object matching:
   "recommendation": "Everyday advice for user"
 }`;
 
-  // 1. Try Gemini first if available
-  if (GEMINI_API_KEY) {
+  // 1. Google Gemini Multi-Key Pool (Up to 4 Keys with Quota Alert & Automatic Failover)
+  if (googleKeyPool.keys.length > 0) {
     try {
-      const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-      const res = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: prompt,
-        config: { responseMimeType: 'application/json' },
+      const res = await googleKeyPool.queryWithAutoFailover({
+        prompt,
+        jsonMode: true,
+        onSwitchNotice,
       });
       if (res.text) {
         const parsed = JSON.parse(res.text);
-        return { ...parsed, engine: 'Google Gemini (gemini-3.8-flash)', modelUsed: 'gemini-3.8-flash' };
+        return {
+          ...parsed,
+          engine: `Google Gemini (${res.modelUsed}) • Key #${res.keyIndex}`,
+          modelUsed: res.modelUsed,
+          keyIndex: res.keyIndex,
+          maskedKey: res.maskedKey,
+        };
       }
     } catch (geminiErr) {
-      console.warn('Gemini query error, falling back to Groq free model:', geminiErr.message);
+      console.warn('Gemini query error across pool:', geminiErr.message);
     }
   }
 
-  // 2. Try Groq with auto-failover across free models
+  // 2. Secondary Groq failover if configured
   if (GROQ_API_KEY) {
     try {
       const groqRes = await queryGroqChatWithAutoFailover({
@@ -1244,7 +1503,7 @@ function formatReportHtml(fileName, audit, quotaRemaining, isOwner, scanId) {
         { text: '📜 View Script Code', callback_data: `code:${scanId}` },
       ],
       [
-        { text: '🤖 Try Free Groq Models', callback_data: 'groq_models' },
+        { text: '🔑 Google Gemini Keys Pool', callback_data: 'keys_status' },
         { text: '🚨 Bootloop Rescue', callback_data: 'recovery' },
       ],
     ],
@@ -1254,7 +1513,7 @@ function formatReportHtml(fileName, audit, quotaRemaining, isOwner, scanId) {
 }
 
 // =======================================================================
-// 6. Comprehensive Root & Security Commands (Over 25+ Useful Commands!)
+// 6. Comprehensive Root & Security Commands (Over 30+ Useful Commands!)
 // =======================================================================
 const userQuestionSessions = new Map();
 
@@ -1265,15 +1524,34 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
 
   switch (command) {
     case '/start': {
+      const activeKey = googleKeyPool.getActiveKey();
+      const activeDesc = activeKey ? `Key #${activeKey.index} (${activeKey.masked})` : 'None Configured';
       const msg = `<b>🛡️ Welcome to RootGuard AI!</b>\n` +
-        `⚡ <i>made by @toshitzz • Multi-Persistence Edition</i>\n` +
+        `⚡ <i>made by @toshitzz • Multi-Key Google Gemini Edition</i>\n` +
         `━━━━━━━━━━━━━━━━━━━━━\n` +
         `I inspect Magisk, KernelSU, and APatch root modules to protect your Android phone from bricks, bootloops, and fake snake-oil tweaks!\n\n` +
-        `<b>Render Persistence Active:</b> <code>${persistenceType}</code>\n` +
-        `• <i>Service restarts will NOT reset your database when connected to Render PostgreSQL or Persistent Disk!</i>\n\n` +
+        `<b>🔑 Google Gemini Pool:</b> <code>${googleKeyPool.keys.length}/4 Keys Configured</code>\n` +
+        `• <b>Active Key:</b> <code>${activeDesc}</code>\n` +
+        `• <b>Active Model:</b> <code>${escapeHtml(googleKeyPool.preferredModel)}</code>\n` +
+        `• <b>Auto-Failover:</b> 🟢 <i>Switches to backup key if quota is hit with live notification!</i>\n\n` +
+        `<b>🗄️ Automatic Persistence:</b> <code>${persistenceType}</code>\n` +
+        `• <i>Zero-config! Restarts on Render will NOT lose user data or VIP status.</i>\n\n` +
         `📤 <b>Send any <code>.zip</code> or <code>.sh</code> file</b> to begin instant AI inspection!\n` +
-        `Type /help to see all 25+ root security commands.`;
-      return await sendTelegramMessage(chatId, msg, replyMsgId);
+        `Type /help to see all 30+ root security & AI commands.`;
+
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: '🔑 View Gemini Keys Pool', callback_data: 'keys_status' },
+            { text: '🤖 List Models', callback_data: 'gemini_models' },
+          ],
+          [
+            { text: '🚨 Bootloop Rescue Guide', callback_data: 'recovery' },
+            { text: '📖 Full Help Menu', callback_data: 'help_menu' },
+          ],
+        ],
+      };
+      return await sendTelegramMessage(chatId, msg, replyMsgId, keyboard);
     }
 
     case '/help': {
@@ -1281,39 +1559,385 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
         `⚡ <i>made by @toshitzz</i>\n` +
         `━━━━━━━━━━━━━━━━━━━━━\n` +
         `<b>🔍 Auditing & Tools:</b>\n` +
-        `• Send any <b>.zip</b> or <b>.sh</b> file to audit\n` +
+        `• Send any <b>.zip</b> or <b>.sh</b> file directly to audit\n` +
+        `• <code>/scan</code> - Instructions on auditing root modules\n` +
         `• <code>/quick &lt;script&gt;</code> - Instant AST code heuristic scan\n` +
-        `• <code>/checkurl &lt;url&gt;</code> - Audit module from direct download URL\n` +
+        `• <code>/checkurl &lt;url&gt;</code> - Audit module from direct download link\n` +
+        `• <code>/recovery</code> - Emergency bootloop rescue guide (Magisk/KernelSU/TWRP)\n` +
         `• <code>/props &lt;tweak&gt;</code> - Analyze Android build.prop tweaks for placebo/risk\n` +
-        `• <code>/debloat &lt;pkg&gt;</code> - Check if an Android app is safe to remove\n` +
-        `• <code>/sepolicy &lt;rule&gt;</code> - Explain SELinux rules and permissions\n` +
+        `• <code>/debloat &lt;pkg&gt;</code> - Check if an Android package is safe to remove\n` +
+        `• <code>/sepolicy &lt;rule&gt;</code> - Analyze SELinux rules and permissions\n` +
         `• <code>/battery</code> - Android battery tweak mythbusters & advice\n` +
-        `• <code>/recovery</code> - Emergency bootloop rescue guide\n` +
+        `• <code>/kernelsu</code> - KernelSU vs Magisk vs APatch comparison\n` +
+        `• <code>/safetynet</code> - Play Integrity & device certification bypass tips\n` +
+        `• <code>/romcheck &lt;rom&gt;</code> - Custom ROM & GSI compatibility advice\n` +
         `• <code>/rules</code> - 6 Golden Rules of Root Safety\n` +
-        `• <code>/myhistory</code> - View your past 5 module audits\n\n` +
-        `<b>🤖 AI Models (Free Plan):</b>\n` +
-        `• <code>/groqmodels</code> - List & benchmark all accessible free Groq models\n` +
-        `• <code>/trymodels</code> - Test Gemini and all free Groq models with ping latency\n` +
-        `• <code>/model</code> - View active model & switch engine\n` +
-        `• <code>/test</code> - Test primary Gemini AI connection\n\n` +
-        `<b>🗄️ Automatic Persistence (Zero .env Setup):</b>\n` +
+        `• <code>/myhistory</code> - View your past 5 module audits\n` +
+        `• <code>/report &lt;id&gt;</code> - Re-open audit report for any past scan\n\n` +
+        `<b>🔑 Google Gemini Multi-Key & Models:</b>\n` +
+        `• <code>/keys</code> - Real-time status of all 4 Google Gemini API keys\n` +
+        `• <code>/switchkey &lt;1-4&gt;</code> - Manually switch active primary Gemini key\n` +
+        `• <code>/models</code> - View all working Gemini models & latencies\n` +
+        `• <code>/setmodel &lt;model&gt;</code> - Select preferred Gemini model\n` +
+        `• <code>/test</code> - Test active Gemini key & model response\n` +
+        `• <code>/benchmark</code> - Ping all 4 keys & models simultaneously\n\n` +
+        `<b>🗄️ Zero-Config Persistence (Render Safe):</b>\n` +
         `• <code>/dbinfo</code> - View active database engine & auto-recovery status\n` +
-        `• <code>/sync</code> - Force instant state snapshot & verify Render restart protection\n` +
+        `• <code>/sync</code> - Force instant state snapshot checkpoint\n` +
+        `• <code>/renderguide</code> - How Render restart protection works\n` +
         `• <code>/quota</code> - Check remaining free scans (resets 00:00 UTC)\n` +
         `• <code>/profile</code> - Your account status & lifetime audits\n` +
-        `• <code>/stats</code> - Global bot metrics & threats prevented\n`;
+        `• <code>/stats</code> - Global bot metrics & threats prevented\n` +
+        `• <code>/ping</code> - Bot latency & API speed test\n` +
+        `• <code>/about</code> - About RootGuard architecture\n`;
 
       if (isOwner) {
         h += `\n👑 <b>Admin Controls:</b>\n` +
           `• <code>/vip &lt;id&gt;</code> - Grant lifetime VIP (Unlimited)\n` +
           `• <code>/unvip &lt;id&gt;</code> - Revoke VIP\n` +
-          `• <code>/resetquota &lt;id&gt;</code> - Reset daily quotas\n` +
-          `• <code>/sync</code> - Force instant state backup flush\n` +
-          `• <code>/broadcast &lt;msg&gt;</code> - Message all bot users\n`;
+          `• <code>/resetquota &lt;id&gt;</code> - Reset user daily quota\n` +
+          `• <code>/broadcast &lt;msg&gt;</code> - Message all bot users\n` +
+          `• <code>/dbbackup</code> - Output raw JSON state snapshot\n`;
       }
 
       h += `\n━━━━━━━━━━━━━━━━━━━━━\n⚡ <i>RootGuard • made by @toshitzz</i>`;
       return await sendTelegramMessage(chatId, h, replyMsgId);
+    }
+
+    case '/scan': {
+      const msg = `📤 <b>How to Audit a Root Module:</b>\n` +
+        `⚡ <i>made by @toshitzz</i>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `1. Simply tap the <b>Paperclip icon (Attach File)</b> in this chat.\n` +
+        `2. Select your Magisk, KernelSU, or APatch <code>.zip</code> or standalone shell script <code>.sh</code>.\n` +
+        `3. RootGuard automatically unpacks scripts, runs AST partition wipe detection, and performs Google Gemini AI audit.\n\n` +
+        `💡 <i>Don't have the file locally? Use <code>/checkurl &lt;direct download link&gt;</code> instead!</i>`;
+      return await sendTelegramMessage(chatId, msg, replyMsgId);
+    }
+
+    case '/keys':
+    case '/apikeys': {
+      let msg = `🔑 <b>Google Gemini Multi-Key Pool (Up to 4 Keys):</b>\n` +
+        `⚡ <i>made by @toshitzz</i>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `RootGuard supports <b>4 Google Gemini API keys</b>. If any key exhausts its daily quota or hits 429 rate limits, it automatically alerts the user and seamlessly switches to the next available backup key!\n\n`;
+
+      if (googleKeyPool.keys.length === 0) {
+        msg += `❌ <b>No Gemini Keys Configured!</b>\nAdd <code>GEMINI_API_KEY</code>, <code>GEMINI_API_KEY_2</code>, etc. in your .env file.`;
+      } else {
+        const now = Date.now();
+        googleKeyPool.keys.forEach((k) => {
+          const isActive = k.index === googleKeyPool.activeKeyIndex;
+          const activeBadge = isActive ? ' ⭐ <b>[ACTIVE PRIMARY]</b>' : '';
+          const isExhausted = k.status === 'EXHAUSTED' && k.exhaustedUntil > now;
+          const coolLeft = isExhausted ? Math.ceil((k.exhaustedUntil - now) / 1000) : 0;
+          const statusIcon = isExhausted ? `⏳ Quota Cooldown (${coolLeft}s)` : k.status === 'HEALTHY' ? '🟢 Ready' : '🔴 Error';
+
+          msg += `<b>Key #${k.index}:</b> <code>${escapeHtml(k.masked)}</code>${activeBadge}\n` +
+            `• Status: ${statusIcon}\n` +
+            `• Requests: <b>${k.requestsCount}</b> (✅ ${k.successCount} | ❌ ${k.failureCount})\n` +
+            `• Last Latency: <b>${k.lastLatencyMs ? `${k.lastLatencyMs}ms` : 'None'}</b>\n\n`;
+        });
+
+        msg += `💡 <i>Type <code>/switchkey &lt;1-${googleKeyPool.keys.length}&gt;</code> to change the active key manually, or <code>/benchmark</code> to ping all keys!</i>`;
+      }
+
+      const inlineButtons = googleKeyPool.keys.map((k) => ({
+        text: `Switch to Key #${k.index}`,
+        callback_data: `switch_key_${k.index}`,
+      }));
+
+      const keyboard = {
+        inline_keyboard: [
+          inlineButtons.slice(0, 2),
+          inlineButtons.slice(2, 4),
+          [{ text: '🏓 Benchmark All Keys', callback_data: 'benchmark_keys' }],
+        ].filter((row) => row.length > 0),
+      };
+
+      return await sendTelegramMessage(chatId, msg, replyMsgId, keyboard);
+    }
+
+    case '/switchkey': {
+      const targetIdx = parseInt(args.trim(), 10);
+      if (isNaN(targetIdx) || targetIdx < 1 || targetIdx > googleKeyPool.keys.length) {
+        return await sendTelegramMessage(
+          chatId,
+          `Usage: <code>/switchkey &lt;1-${googleKeyPool.keys.length}&gt;</code>\nExample: <code>/switchkey 2</code>`,
+          replyMsgId
+        );
+      }
+      const switched = googleKeyPool.switchActiveKey(targetIdx);
+      if (switched) {
+        const k = googleKeyPool.keys.find((x) => x.index === targetIdx);
+        return await sendTelegramMessage(
+          chatId,
+          `✅ <b>Active Google API Key Switched!</b>\nNow using <b>Key #${targetIdx}</b>: <code>${k?.masked}</code>\n\nType <code>/test</code> to verify.`,
+          replyMsgId
+        );
+      }
+      return await sendTelegramMessage(chatId, `❌ Could not switch to Key #${targetIdx}.`, replyMsgId);
+    }
+
+    case '/models':
+    case '/geminimodels': {
+      let msg = `🤖 <b>Google Gemini Model Catalog:</b>\n` +
+        `⚡ <i>made by @toshitzz</i>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `• <b>Active Model:</b> <code>${escapeHtml(googleKeyPool.preferredModel)}</code>\n` +
+        `• <b>Active Key:</b> <code>Key #${googleKeyPool.activeKeyIndex}</code>\n\n` +
+        `<b>Available Candidate Models:</b>\n`;
+
+      GEMINI_CANDIDATE_MODELS.forEach((m) => {
+        const isActive = m === googleKeyPool.preferredModel;
+        const lat = googleKeyPool.modelLatencies.get(m);
+        const badge = isActive ? ' ⭐ <b>[ACTIVE]</b>' : '';
+        const latText = lat ? `🟢 ${lat}ms` : '⚪ Ready';
+        msg += `• <code>${escapeHtml(m)}</code> - ${latText}${badge}\n`;
+      });
+
+      msg += `\n💡 <i>RootGuard automatically discovers and uses the best available model. Type <code>/setmodel &lt;name&gt;</code> to set preferred model!</i>`;
+
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: 'Set: gemini-2.5-flash', callback_data: 'set_model_gemini-2.5-flash' },
+            { text: 'Set: gemini-3.8-flash', callback_data: 'set_model_gemini-3.8-flash' },
+          ],
+          [
+            { text: 'Set: gemini-2.0-flash', callback_data: 'set_model_gemini-2.0-flash' },
+            { text: '🏓 Benchmark All Models', callback_data: 'benchmark_models' },
+          ],
+        ],
+      };
+      return await sendTelegramMessage(chatId, msg, replyMsgId, keyboard);
+    }
+
+    case '/setmodel': {
+      const choice = args.trim().toLowerCase();
+      if (!choice) {
+        return await sendTelegramMessage(
+          chatId,
+          `Usage: <code>/setmodel &lt;model-name&gt;</code>\nExample: <code>/setmodel gemini-2.5-flash</code>\nType /models to view choices.`,
+          replyMsgId
+        );
+      }
+      googleKeyPool.setPreferredModel(choice);
+      return await sendTelegramMessage(
+        chatId,
+        `✅ Preferred model set to: <code>${escapeHtml(choice)}</code>\nType <code>/test</code> to ping it!`,
+        replyMsgId
+      );
+    }
+
+    case '/test': {
+      const activeKey = googleKeyPool.getActiveKey();
+      if (!activeKey) {
+        return await sendTelegramMessage(chatId, `⚠️ No Google Gemini API key configured in .env`, replyMsgId);
+      }
+      const statusMsg = await sendTelegramMessage(chatId, `📡 <i>Testing Google Gemini Key #${activeKey.index} (${activeKey.masked})...</i>`, replyMsgId);
+
+      const t0 = Date.now();
+      try {
+        const ai = new GoogleGenAI({ apiKey: activeKey.key });
+        const res = await ai.models.generateContent({
+          model: googleKeyPool.preferredModel,
+          contents: 'Reply with "Google Gemini Online OK" and state your current model version in under 15 words.',
+        });
+        const elapsed = Date.now() - t0;
+        const text = `✅ <b>Google Gemini AI Online!</b>\n` +
+          `⚡ <i>made by @toshitzz</i>\n` +
+          `━━━━━━━━━━━━━━━━━━━━━\n` +
+          `• <b>Key Used:</b> Key #${activeKey.index} (<code>${escapeHtml(activeKey.masked)}</code>)\n` +
+          `• <b>Model:</b> <code>${escapeHtml(googleKeyPool.preferredModel)}</code>\n` +
+          `• <b>Ping Latency:</b> <b>${elapsed}ms</b>\n` +
+          `• <b>Response:</b> <i>${escapeHtml(res.text?.trim() || 'OK')}</i>\n` +
+          `• <b>Spare Backup Keys:</b> <b>${googleKeyPool.keys.length - 1}</b> available for failover`;
+
+        if (statusMsg?.result?.message_id) {
+          return await editTelegramMessage(chatId, statusMsg.result.message_id, text);
+        }
+        return await sendTelegramMessage(chatId, text, replyMsgId);
+      } catch (e) {
+        const errText = `❌ <b>Gemini Test Failed:</b>\n<code>${escapeHtml(e.message)}</code>\n\n💡 <i>If this key ran out of quota, type /switchkey to rotate!</i>`;
+        if (statusMsg?.result?.message_id) {
+          return await editTelegramMessage(chatId, statusMsg.result.message_id, errText);
+        }
+        return await sendTelegramMessage(chatId, errText, replyMsgId);
+      }
+    }
+
+    case '/benchmark': {
+      if (googleKeyPool.keys.length === 0) {
+        return await sendTelegramMessage(chatId, `⚠️ No Google Gemini API keys configured.`, replyMsgId);
+      }
+      const statusMsg = await sendTelegramMessage(chatId, `🏓 <i>Benchmarking all Google Gemini API keys & available models...</i>`, replyMsgId);
+      const keyResults = await googleKeyPool.benchmarkAllKeys();
+      const modelResults = await googleKeyPool.benchmarkAllModels();
+
+      let out = `🏓 <b>Google Gemini Pool Benchmark:</b>\n` +
+        `⚡ <i>made by @toshitzz</i>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `<b>🔑 API Key Latencies:</b>\n`;
+
+      keyResults.forEach((r) => {
+        const icon = r.status === 'HEALTHY' ? '🟢' : r.status === 'EXHAUSTED' ? '⏳' : '🔴';
+        const active = r.isActive ? ' ⭐' : '';
+        out += `${icon} <b>Key #${r.index}</b> (<code>${r.masked}</code>): <b>${r.latencyMs}ms</b> (${r.status})${active}\n`;
+      });
+
+      out += `\n<b>🤖 Candidate Model Availability:</b>\n`;
+      modelResults.forEach((m) => {
+        const icon = m.status === 'AVAILABLE' ? '🟢' : '🔴';
+        out += `${icon} <code>${escapeHtml(m.model)}</code>: <b>${m.latencyMs}ms</b> (${m.status})\n`;
+      });
+
+      out += `\n⚡ <i>Automatic failover is ready! If any key hits rate limits, the next key takes over instantly.</i>`;
+
+      if (statusMsg?.result?.message_id) {
+        return await editTelegramMessage(chatId, statusMsg.result.message_id, out);
+      }
+      return await sendTelegramMessage(chatId, out, replyMsgId);
+    }
+
+    case '/checkurl': {
+      const targetUrl = args.trim();
+      if (!targetUrl || (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://'))) {
+        return await sendTelegramMessage(
+          chatId,
+          `Usage: <code>/checkurl &lt;direct download URL&gt;</code>\n\nExample:\n<code>/checkurl https://raw.githubusercontent.com/user/repo/main/install.sh</code>`,
+          replyMsgId
+        );
+      }
+
+      const lock = await dbCheckCooldownAndLock(cleanId);
+      if (!lock.allowed) {
+        if (lock.reason === 'COOLDOWN') return await sendTelegramMessage(chatId, `⏳ Cooldown active: wait ${lock.remainingSeconds}s.`, replyMsgId);
+        if (lock.reason === 'QUOTA_EXCEEDED') return await sendTelegramMessage(chatId, `⛔ Daily quota reached (5/5). Resets at 00:00 UTC.`, replyMsgId);
+        return;
+      }
+
+      const statusMsg = await sendTelegramMessage(chatId, `📥 <i>Downloading module from URL...</i>`, replyMsgId);
+      const statusId = statusMsg?.result?.message_id;
+
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 30000);
+        const res = await fetch(targetUrl, { signal: controller.signal });
+        clearTimeout(timer);
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}: Could not download URL.`);
+        const buf = await res.arrayBuffer().then(Buffer.from);
+        const urlParts = targetUrl.split('/');
+        const rawFileName = urlParts[urlParts.length - 1].split('?')[0] || 'remote_module.sh';
+
+        const isZip = rawFileName.toLowerCase().endsWith('.zip');
+        const scripts = [];
+
+        if (!isZip) {
+          scripts.push({ path: rawFileName, content: buf.toString('utf-8') });
+        } else {
+          const zip = await JSZip.loadAsync(buf);
+          for (const p of Object.keys(zip.files)) {
+            if (p.endsWith('.sh') || p.endsWith('.prop') || p.includes('customize.sh') || p.includes('service.sh')) {
+              const content = await zip.files[p].async('string');
+              scripts.push({ path: p, content });
+            }
+          }
+        }
+
+        if (statusId) {
+          await editTelegramMessage(chatId, statusId, `🤖 <i>Auditing ${scripts.length} script(s) with Google Gemini Multi-Key Engine...</i>`);
+        }
+
+        const onSwitchNotice = async (noticeHtml) => {
+          if (statusId) await editTelegramMessage(chatId, statusId, noticeHtml);
+        };
+
+        const audit = await auditModuleWithAI(rawFileName, scripts, { name: rawFileName }, onSwitchNotice);
+        const scanId = `sc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
+        await dbReleaseLockAndRecordScan(cleanId, {
+          file_name: rawFileName,
+          file_size: buf.length,
+          verdict: audit.verdict,
+          risk_score: audit.riskScore,
+          model_used: audit.modelUsed || 'AI',
+          duration_ms: 2500,
+        });
+
+        await dbSaveScanCache(scanId, rawFileName, audit, scripts);
+        const quota = await dbGetUserQuota(cleanId);
+        const { text, replyMarkup } = formatReportHtml(rawFileName, audit, quota.remaining, isOwner, scanId);
+
+        if (statusId) return await editTelegramMessage(chatId, statusId, text, replyMarkup);
+        return await sendTelegramMessage(chatId, text, replyMsgId, replyMarkup);
+      } catch (err) {
+        await dbForceReleaseLock(cleanId);
+        const errText = `❌ <b>URL Audit Failed:</b> ${escapeHtml(err.message)}`;
+        if (statusId) return await editTelegramMessage(chatId, statusId, errText);
+        return await sendTelegramMessage(chatId, errText, replyMsgId);
+      }
+    }
+
+    case '/kernelsu': {
+      const msg = `⚡ <b>KernelSU vs Magisk vs APatch:</b>\n` +
+        `⚡ <i>made by @toshitzz</i>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `<b>1. KernelSU (Kernel-Space Root):</b>\n` +
+        `• <b>How it works:</b> Hooks system calls directly inside the Linux Kernel (GKI 5.10+).\n` +
+        `• <b>Stealth:</b> Apps cannot see su binaries in userspace because ungranted apps see standard system calls!\n` +
+        `• <b>Modules:</b> Uses OverlayFS instead of magic mount.\n\n` +
+        `<b>2. Magisk (User-Space Root):</b>\n` +
+        `• <b>How it works:</b> Patches boot.img ramdisk to start magiskd daemon on early boot.\n` +
+        `• <b>Stealth:</b> Relies on Zygisk + Shamiko/ZygiskNext to hide from banking apps.\n\n` +
+        `<b>3. APatch (Kernel Patch without Full Kernel Compile):</b>\n` +
+        `• <b>How it works:</b> Injects KernelPatch directly into standard boot.img kernel binary.\n` +
+        `• <b>Stealth:</b> Superpatch hooks allow kernel-level privilege elevation with easy flashing.\n\n` +
+        `💡 <i>RootGuard checks modules for compatibility with all 3 engines!</i>`;
+      return await sendTelegramMessage(chatId, msg, replyMsgId);
+    }
+
+    case '/safetynet':
+    case '/playintegrity': {
+      const msg = `🛡️ <b>Play Integrity & Device Certification Guide:</b>\n` +
+        `⚡ <i>made by @toshitzz</i>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `SafetyNet is deprecated and replaced by <b>Play Integrity API</b>:\n\n` +
+        `<b>The 3 Integrity Verdicts:</b>\n` +
+        `1. <b>MEETS_BASIC_INTEGRITY:</b> Device is intact (passes on virtually all rooted setups with basic Zygisk).\n` +
+        `2. <b>MEETS_DEVICE_INTEGRITY:</b> Required by Google Wallet, Pokémon GO, and Banking apps. Passed using <i>PlayIntegrityFork (PIF)</i> or <i>PlayIntegrityFix</i> with custom pif.json fingerprints.\n` +
+        `3. <b>MEETS_STRONG_INTEGRITY:</b> Hardware-backed keystore evaluation (unlocked bootloaders fail unless using advanced keybox exploits like TrickyStore).\n\n` +
+        `⚠️ <i>Warning: Never flash sketchy 'instant strong integrity' modules that demand your Google account password!</i>`;
+      return await sendTelegramMessage(chatId, msg, replyMsgId);
+    }
+
+    case '/romcheck': {
+      const romName = args.trim() || 'Custom ROM';
+      const msg = `📱 <b>Custom ROM Compatibility Guide (${escapeHtml(romName)}):</b>\n` +
+        `⚡ <i>made by @toshitzz</i>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `<b>Flashing Root Modules on Custom ROMs:</b>\n` +
+        `• <b>AOSP / Pixel Experience / LineageOS:</b> High compatibility. Stock Android framework makes standard Magisk/KernelSU modules safe.\n` +
+        `• <b>OEM ROMs (HyperOS, OneUI, ColorOS):</b> Caution! Heavy vendor frameworks often crash when flashing generic AOSP systemUI blur or status bar modules.\n` +
+        `• <b>GSI (Generic System Images):</b> Dynamic partitions and vendor overlay trees differ. Avoid modules touching <code>/vendor</code> directly.\n\n` +
+        `💡 <i>Always test module scripts with RootGuard before rebooting!</i>`;
+      return await sendTelegramMessage(chatId, msg, replyMsgId);
+    }
+
+    case '/about': {
+      const stats = await dbGetStats();
+      const msg = `🛡️ <b>About RootGuard AI:</b>\n` +
+        `⚡ <i>made with craftsmanship by @toshitzz</i>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `RootGuard is a specialized security auditor designed specifically for Android root enthusiasts, developers, and modders.\n\n` +
+        `• <b>AI Core:</b> Google Gemini Multi-Key Pool (Up to 4 Keys with Live Failover)\n` +
+        `• <b>Heuristic Scanner:</b> Strict partition wipe & chmod bootloop detection\n` +
+        `• <b>Persistence:</b> Automatic zero-config snapshotting (Render crash & restart safe!)\n` +
+        `• <b>Audits Completed:</b> <b>${stats.totalScans}</b>\n` +
+        `• <b>Bootloops Prevented:</b> <b>${stats.totalBricksStopped}</b>\n\n` +
+        `⚡ <i>Stay safe, never flash unverified modules blindly!</i>`;
+      return await sendTelegramMessage(chatId, msg, replyMsgId);
     }
 
     case '/sync': {
@@ -1358,55 +1982,6 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
         `3. <b>Background Sync:</b> State flushes every 30s and after every module scan.\n\n` +
         `💡 <i>Optional: If you ever want to connect a PostgreSQL database, just add DATABASE_URL, but it is 100% OPTIONAL!</i>`;
       return await sendTelegramMessage(chatId, guide, replyMsgId);
-    }
-
-    case '/groqmodels': {
-      const live = await discoverLiveGroqModels();
-      let msg = `🤖 <b>Groq Free Plan Models:</b>\n` +
-        `⚡ <i>made by @toshitzz</i>\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n` +
-        `• <b>Active Model:</b> <code>${escapeHtml(groqTelemetry.activeModel)}</code>\n\n` +
-        `<b>Available Free Models:</b>\n`;
-
-      const list = live.ok ? live.models : KNOWN_FREE_GROQ_MODELS;
-      list.forEach((m) => {
-        const lat = groqTelemetry.modelLatency.get(m);
-        const err = groqTelemetry.modelErrors.get(m);
-        const status = err ? '❌ Err' : (lat ? `🟢 ${lat}ms` : '⚪ Ready');
-        msg += `• <code>${escapeHtml(m)}</code> - ${status}\n`;
-      });
-
-      msg += `\n💡 <i>RootGuard automatically fails over to the next free model if one model hits rate limits (429)!</i>\n` +
-        `Tap below or type <code>/trymodels</code> to benchmark all models simultaneously.`;
-
-      const keyboard = {
-        inline_keyboard: [
-          [{ text: '🏓 Benchmark All Free Models', callback_data: 'test_all_groq' }],
-        ],
-      };
-      return await sendTelegramMessage(chatId, msg, replyMsgId, keyboard);
-    }
-
-    case '/trymodels': {
-      const statusMsg = await sendTelegramMessage(chatId, `🏓 <i>Benchmarking all free Groq models & Gemini...</i>`, replyMsgId);
-      const results = await testAllGroqModels();
-
-      let out = `🏓 <b>AI Models Benchmark Report:</b>\n` +
-        `⚡ <i>made by @toshitzz</i>\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n`;
-
-      results.forEach((r) => {
-        const icon = r.status === 'HEALTHY' ? '🟢' : '🔴';
-        out += `${icon} <code>${escapeHtml(r.model)}</code>: <b>${r.latencyMs}ms</b> (${r.status})\n`;
-      });
-
-      out += `\n🏆 <b>Fastest Free Model:</b> <code>${results.filter((r) => r.status === 'HEALTHY').sort((a, b) => a.latencyMs - b.latencyMs)[0]?.model || 'llama-3.1-8b-instant'}</code>\n` +
-        `⚡ <i>RootGuard uses this auto-failover list to guarantee zero audit downtime!</i>`;
-
-      if (statusMsg?.result?.message_id) {
-        return await editTelegramMessage(chatId, statusMsg.result.message_id, out);
-      }
-      return await sendTelegramMessage(chatId, out, replyMsgId);
     }
 
     case '/props': {
@@ -1514,6 +2089,20 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
       return await sendTelegramMessage(chatId, out, replyMsgId);
     }
 
+    case '/report': {
+      const targetScanId = args.trim();
+      if (!targetScanId) {
+        return await sendTelegramMessage(chatId, `Usage: <code>/report &lt;scanId&gt;</code>`, replyMsgId);
+      }
+      const cached = await dbGetScanCache(targetScanId);
+      if (!cached) {
+        return await sendTelegramMessage(chatId, `❌ Scan report <code>${escapeHtml(targetScanId)}</code> not found or expired.`, replyMsgId);
+      }
+      const quota = await dbGetUserQuota(cleanId);
+      const { text, replyMarkup } = formatReportHtml(cached.fileName, cached.audit, quota.remaining, isOwner, targetScanId);
+      return await sendTelegramMessage(chatId, text, replyMsgId, replyMarkup);
+    }
+
     case '/rules': {
       const rules = `🛡️ <b>6 Golden Rules of Root Safety:</b>\n` +
         `⚡ <i>made by @toshitzz</i>\n` +
@@ -1570,11 +2159,30 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
       );
     }
 
+    case '/profile':
+    case '/myid': {
+      const quota = await dbGetUserQuota(cleanId);
+      const history = await dbGetUserHistory(cleanId, 50);
+      const msg = `👤 <b>Your RootGuard Profile:</b>\n` +
+        `⚡ <i>made by @toshitzz</i>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `• <b>Telegram ID:</b> <code>${cleanId}</code>\n` +
+        `• <b>Account Role:</b> ${isOwner ? '👑 <b>Owner / SuperAdmin</b>' : quota.isVip ? '⭐ <b>VIP Member (Unlimited)</b>' : '👤 <b>Standard User</b>'}\n` +
+        `• <b>Remaining Scans Today:</b> <b>${quota.isVip ? 'Unlimited' : `${quota.remaining}/${DAILY_SCAN_LIMIT}`}</b>\n` +
+        `• <b>Total Lifetime Scans:</b> <b>${history.length}</b>\n` +
+        `• <b>Render Persistence:</b> 🟢 <b>Synced</b>`;
+      return await sendTelegramMessage(chatId, msg, replyMsgId);
+    }
+
     case '/ping': {
       const t0 = Date.now();
       const m = await sendTelegramMessage(chatId, `🏓 <i>Pinging...</i>`, replyMsgId);
       const lat = Date.now() - t0;
-      const text = `🏓 <b>Pong!</b> <code>${lat}ms</code>\n• Persistence: <b>${persistenceType}</b>\n• Default Groq Model: <code>${escapeHtml(groqTelemetry.activeModel)}</code>`;
+      const activeKey = googleKeyPool.getActiveKey();
+      const text = `🏓 <b>Pong!</b> <code>${lat}ms</code>\n` +
+        `• <b>Persistence:</b> <b>${persistenceType}</b>\n` +
+        `• <b>Active Google Key:</b> Key #${activeKey ? activeKey.index : 'None'}\n` +
+        `• <b>Active Model:</b> <code>${escapeHtml(googleKeyPool.preferredModel)}</code>`;
       if (m?.result?.message_id) return await editTelegramMessage(chatId, m.result.message_id, text);
       return await sendTelegramMessage(chatId, text, replyMsgId);
     }
@@ -1587,21 +2195,11 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
         `• Total Users: <b>${stats.totalUsers}</b>\n` +
         `• Total Audits: <b>${stats.totalScans}</b>\n` +
         `• Bricks Prevented: <b>${stats.totalBricksStopped}</b>\n` +
+        `• Google Gemini Keys: <b>${googleKeyPool.keys.length}/4 Active</b>\n` +
         `• Database: <b>${stats.persistenceType}</b>\n` +
         `⚡ <i>made by @toshitzz</i>`,
         replyMsgId
       );
-    }
-
-    case '/test': {
-      if (!GEMINI_API_KEY) return await sendTelegramMessage(chatId, `⚠️ GEMINI_API_KEY missing in .env`, replyMsgId);
-      try {
-        const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-        const res = await ai.models.generateContent({ model: 'gemini-3.8-flash', contents: 'Reply with OK' });
-        return await sendTelegramMessage(chatId, `✅ Gemini AI Online: <code>${escapeHtml(res.text?.trim() || 'OK')}</code>`, replyMsgId);
-      } catch (e) {
-        return await sendTelegramMessage(chatId, `❌ Gemini Test Failed: ${escapeHtml(e.message)}`, replyMsgId);
-      }
     }
 
     case '/vip': {
@@ -1617,6 +2215,19 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
       return await sendTelegramMessage(chatId, `👑 User <code>${target}</code> granted permanent VIP!`, replyMsgId);
     }
 
+    case '/unvip': {
+      if (!isOwner) return await sendTelegramMessage(chatId, `⛔ Access denied.`, replyMsgId);
+      const target = args.trim().replace(/^tg:/i, '');
+      if (!target) return await sendTelegramMessage(chatId, `Usage: <code>/unvip &lt;userId&gt;</code>`, replyMsgId);
+      if (persistenceType === 'POSTGRES' && pgPool) {
+        await pgPool.query('UPDATE rg_users SET is_vip = 0 WHERE user_id = $1', [target]);
+      } else if (sqliteDb) {
+        sqliteDb.prepare('UPDATE users SET is_vip = 0 WHERE user_id = ?').run(target);
+      }
+      autoFlushLocalState();
+      return await sendTelegramMessage(chatId, `User <code>${target}</code> VIP status revoked.`, replyMsgId);
+    }
+
     case '/resetquota': {
       if (!isOwner) return await sendTelegramMessage(chatId, `⛔ Access denied.`, replyMsgId);
       const target = args.trim().replace(/^tg:/i, '');
@@ -1624,6 +2235,36 @@ async function handleCommand(chatId, rawUserId, command, args, replyMsgId) {
       await dbResetQuota(target);
       autoFlushLocalState();
       return await sendTelegramMessage(chatId, `🔄 Quota reset for <code>${target}</code>.`, replyMsgId);
+    }
+
+    case '/broadcast': {
+      if (!isOwner) return await sendTelegramMessage(chatId, `⛔ Access denied.`, replyMsgId);
+      const bMsg = args.trim();
+      if (!bMsg) return await sendTelegramMessage(chatId, `Usage: <code>/broadcast &lt;message&gt;</code>`, replyMsgId);
+
+      const allUsers = memoryStore.users ? Array.from(memoryStore.users.keys()) : [];
+      let sentCount = 0;
+      for (const uId of allUsers) {
+        try {
+          await sendTelegramMessage(uId, `📢 <b>RootGuard Broadcast Announcement:</b>\n\n${escapeHtml(bMsg)}\n\n⚡ <i>by @toshitzz</i>`);
+          sentCount++;
+          await sleepMs(50);
+        } catch (e) {}
+      }
+      return await sendTelegramMessage(chatId, `✅ Broadcast sent to ${sentCount} active users!`, replyMsgId);
+    }
+
+    case '/dbbackup': {
+      if (!isOwner) return await sendTelegramMessage(chatId, `⛔ Access denied.`, replyMsgId);
+      autoFlushLocalState();
+      const stats = await dbGetStats();
+      const backupText = JSON.stringify({
+        exportedAt: new Date().toISOString(),
+        stats,
+        usersCount: memoryStore.users.size,
+        scansCount: memoryStore.scans.length,
+      }, null, 2);
+      return await sendTelegramMessage(chatId, `<pre><code>${escapeHtml(backupText)}</code></pre>`, replyMsgId);
     }
 
     default:
@@ -1667,10 +2308,19 @@ async function processModuleFile(chatId, rawUserId, msg, fileName) {
     }
 
     if (statusId) {
-      await editTelegramMessage(chatId, statusId, `🤖 <i>Auditing ${scripts.length} script(s) with AI & Partition Safeguards...</i>`);
+      await editTelegramMessage(chatId, statusId, `🤖 <i>Auditing ${scripts.length} script(s) with Google Gemini Multi-Key Safeguards...</i>`);
     }
 
-    const audit = await auditModuleWithAI(fileName, scripts, metadata);
+    // Real-time failover notice to user if a Google API Key runs out of quota
+    const onSwitchNotice = async (noticeHtml) => {
+      if (statusId) {
+        await editTelegramMessage(chatId, statusId, noticeHtml);
+      } else {
+        await sendTelegramMessage(chatId, noticeHtml);
+      }
+    };
+
+    const audit = await auditModuleWithAI(fileName, scripts, metadata, onSwitchNotice);
     const scanId = `sc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
     await dbReleaseLockAndRecordScan(cleanId, {
@@ -1706,6 +2356,26 @@ async function handleUpdate(update) {
     const chatId = cq.message?.chat?.id;
     answerCallbackQuery(cq.id).catch(() => {});
 
+    if (data === 'keys_status') {
+      return await handleCommand(chatId, cq.from?.id, '/keys', '', cq.message?.message_id);
+    }
+    if (data === 'benchmark_keys' || data === 'benchmark_models') {
+      return await handleCommand(chatId, cq.from?.id, '/benchmark', '', cq.message?.message_id);
+    }
+    if (data === 'gemini_models') {
+      return await handleCommand(chatId, cq.from?.id, '/models', '', cq.message?.message_id);
+    }
+    if (data === 'help_menu') {
+      return await handleCommand(chatId, cq.from?.id, '/help', '', cq.message?.message_id);
+    }
+    if (data.startsWith('switch_key_')) {
+      const idx = data.replace('switch_key_', '');
+      return await handleCommand(chatId, cq.from?.id, '/switchkey', idx, cq.message?.message_id);
+    }
+    if (data.startsWith('set_model_')) {
+      const model = data.replace('set_model_', '');
+      return await handleCommand(chatId, cq.from?.id, '/setmodel', model, cq.message?.message_id);
+    }
     if (data === 'test_all_groq') {
       return await handleCommand(chatId, cq.from?.id, '/trymodels', '', cq.message?.message_id);
     }
@@ -1754,9 +2424,21 @@ async function handleUpdate(update) {
     const qPrompt = `User question about Android root module ${cached.fileName}:\n"${text}"\n\nModule audit:\nVerdict: ${cached.audit?.verdict}\nWhat it does: ${cached.audit?.whatThisModuleDoes}\n\nAnswer simply, objectively in under 200 words.`;
     let reply = 'Could not generate answer.';
     try {
-      const groqRes = await queryGroqChatWithAutoFailover({ messages: [{ role: 'user', content: qPrompt }] });
-      reply = groqRes.content;
-    } catch (e) {}
+      const qRes = await googleKeyPool.queryWithAutoFailover({
+        prompt: qPrompt,
+        onSwitchNotice: async (notice) => {
+          await sendTelegramMessage(chatId, notice);
+        },
+      });
+      reply = qRes.text;
+    } catch (e) {
+      if (GROQ_API_KEY) {
+        try {
+          const groqRes = await queryGroqChatWithAutoFailover({ messages: [{ role: 'user', content: qPrompt }] });
+          reply = groqRes.content;
+        } catch (ge) {}
+      }
+    }
 
     return await sendTelegramMessage(chatId, `💬 <b>RootGuard AI Answer:</b>\n\n${reply}`, msg.message_id);
   }
@@ -1792,16 +2474,19 @@ async function startBot() {
   // Register commands menu in Telegram
   await callTelegram('setMyCommands', {
     commands: [
-      { command: 'start', description: '🛡️ Start RootGuard & Overview' },
-      { command: 'help', description: '📖 All 25+ Root Security Commands' },
-      { command: 'dbinfo', description: '🗄️ Check Database & Persistence' },
-      { command: 'renderguide', description: '🚀 Prevent Render DB Reset' },
-      { command: 'groqmodels', description: '🤖 Test Free Groq Models' },
-      { command: 'trymodels', description: '🏓 Benchmark AI Latency' },
-      { command: 'quick', description: '⚡ Instant Code Heuristic Scan' },
-      { command: 'recovery', description: '🚨 Bootloop Rescue Guide' },
+      { command: 'start', description: '🛡️ Start RootGuard & Multi-Key Overview' },
+      { command: 'help', description: '📖 All 30+ Root Security & AI Commands' },
+      { command: 'keys', description: '🔑 Google Gemini 4-Key Pool Dashboard' },
+      { command: 'models', description: '🤖 Live Candidate Gemini Models' },
+      { command: 'test', description: '📡 Test Active Gemini AI Response' },
+      { command: 'benchmark', description: '🏓 Ping All 4 Keys & Models' },
+      { command: 'recovery', description: '🚨 Emergency Bootloop Rescue Guide' },
+      { command: 'props', description: '🔍 Analyze build.prop Tweaks' },
+      { command: 'debloat', description: '📱 Safe System App Removal Checker' },
+      { command: 'dbinfo', description: '🗄️ Zero-Config Persistence Status' },
+      { command: 'sync', description: '🔄 Force State Snapshot Checkpoint' },
       { command: 'quota', description: '📊 Check Free Daily Scans' },
-      { command: 'myhistory', description: '📜 Your Last 5 Audits' },
+      { command: 'myhistory', description: '📜 Your Last 5 Module Audits' },
     ],
   });
 
